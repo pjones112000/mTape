@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.32510.428
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "mtape", "mtape.csproj", "{AAE0824F-0438-4AFD-8C50-27D62D8C2229}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{AAE0824F-0438-4AFD-8C50-27D62D8C2229}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AAE0824F-0438-4AFD-8C50-27D62D8C2229}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AAE0824F-0438-4AFD-8C50-27D62D8C2229}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AAE0824F-0438-4AFD-8C50-27D62D8C2229}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {EC85C5E9-9EA2-4140-99EE-03D4C849AE47}
+	EndGlobalSection
+EndGlobal
