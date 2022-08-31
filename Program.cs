@@ -10,7 +10,8 @@ using System.Diagnostics;
 using System.Text.RegularExpressions;
 using System.Net.Mail;
 using System.Data.SQLite;
-
+using System.Web;
+using System.IO.Compression;
 
 namespace mtape
 {
@@ -21,9 +22,27 @@ namespace mtape
         private static String m_Filename = string.Empty;
         private static string m_Output = string.Empty;
         private static String newTapeScript = string.Empty;
-        private static int m_VolumeNumber = 1;
+        private static int m_VolumeNumber = 0;
         private static long m_NeededPosition = 0;
         private static long m_CurrentPosition = 0;
+        private static long m_OverridePosition = -1;
+        private static string m_LogFile = string.Empty;
+        private static string m_ErrorLog = string.Empty;
+
+
+        private const int NewTape = 0;
+        private const int StartBackup = 1;
+        private const int EndBackup = 2;
+        private const int Alert = 3;
+        private const int TapeNeeded = 4;
+        private const int Clean = 5;
+        private static string m_Message = string.Empty;
+        private static string m_tapeDrive = string.Empty;
+
+
+        private static Dictionary<String, String> m_GlobalVariables = new Dictionary<string, string>();
+        private static Dictionary<String, List<String>> mFunctions = new Dictionary<string, List<string>>();
+        private static Dictionary<String, List<String>> mFunctParams = new Dictionary<string, List<string>>();
 
 
         /// <summary>
@@ -57,6 +76,14 @@ namespace mtape
                         SetTape(args[argCnt + 1]); // next value must be the drive name
                         argCnt++; // increment counter to skip next value.
                         break;
+                    case "-L":
+                        m_LogFile = args[argCnt + 1];
+                        argCnt++;
+                        break;
+                    case "-LE":
+                        m_ErrorLog = args[argCnt + 1];
+                        argCnt++;
+                        break;
                     case "--version":
                         System.Reflection.Assembly assm = System.Reflection.Assembly.GetExecutingAssembly();
 
@@ -70,7 +97,7 @@ namespace mtape
                         var copyright = versionInfo.LegalCopyright;
                         System.Console.WriteLine(copyright);
 
-                        
+
                         return;
                         break;
                     case "--newtape":
@@ -88,7 +115,7 @@ namespace mtape
                         else
                         {
                             if (!command(args[argCnt]))
-                                {
+                            {
                                 if (m_Filename == string.Empty)
                                 {
                                     m_Filename = args[argCnt];
@@ -103,7 +130,7 @@ namespace mtape
                 }
             }
 
-            System.Console.WriteLine("Tape device " + API.TapeDrive);
+            LogMessage("Main", "Tape device " + API.TapeDrive);
 
             for (int argCnt = 0; argCnt < argMax; argCnt++)
             {
@@ -319,8 +346,8 @@ namespace mtape
                         STSETCLN();
                         break;
                     case "test":
-                        m_Filename = @"d:\temp\jre-8u333-windows-au.exe";
-                        Locate();
+                        NextTape();
+                        Environment.Exit(1);
                         break;
                     case "locate":
                         Locate();
@@ -345,7 +372,13 @@ namespace mtape
                         break;
                 }
             }
+            if (API.IsTapeOpen())
+            {
+                API.Close();
+            }
         }
+
+
 
         /// <summary>
         /// Locates a file in the tape library and requests the volume that that file is located on, then positions the tape at that file.
@@ -400,6 +433,14 @@ namespace mtape
         /// </summary>
         private static void WriteTapeFromList()
         {
+            if (newTapeScript != string.Empty)
+            {
+                int retCode = 0;
+                //  Will need to return 0 (true) or -1 (false) to continue or not.
+                runMTapeScript(StartBackup, newTapeScript, out retCode, "");
+                addVolumeToDatabase();
+            }
+
             StreamReader sr = new StreamReader(m_Filename);
             using (StreamWriter transWrite = new StreamWriter("transWrite.trn", true))
             {
@@ -411,13 +452,40 @@ namespace mtape
                     // Write the file to tape at current location
                     if (System.IO.File.Exists(tmpFile))
                     {
+                        WriteFileHeader(tmpFile);
                         WriteFile(tmpFile);
                     }
                     // Record that it was written (last file might be duplicated...but, shouldn't be an issue)
                     transWrite.WriteLine(tmpFile);
                 }
             }
+            if (newTapeScript != string.Empty)
+            {
+                int retCode = 0;
+                //  Will need to return 0 (true) or -1 (false) to continue or not.
+                runMTapeScript(EndBackup, newTapeScript, out retCode, "");
+            }
+
             LogMessage("WriteList", "Done");
+        }
+
+
+        private static void WriteFileHeader(String FileName)
+        {
+            System.IO.FileInfo FI = new FileInfo(FileName);
+            String JSONString = string.Empty;
+
+            if (System.IO.File.Exists("FileInfo.JSON"))
+            {
+                System.IO.File.Delete("FileInfo.JSON");
+            }
+            JSONString += "{\"Name\":\"" + HttpUtility.HtmlEncode(FI.Name) + "\",\"CreationTime\":\"" + HttpUtility.HtmlEncode(FI.CreationTime) + "\",\"ModifyTime\":\"" + HttpUtility.HtmlEncode(FI.LastWriteTime) + "\",\"FileSize\":" + HttpUtility.HtmlEncode(FI.Length.ToString()) + "}";
+            using (System.IO.StreamWriter SW = System.IO.File.CreateText("FileInfo.JSON"))
+            {
+                SW.WriteLine(JSONString);
+            }
+            WriteFile("FileInfo.JSON", true,false);
+            System.IO.File.Delete("FileInfo.JSON");
         }
 
         /// <summary>
@@ -469,7 +537,7 @@ namespace mtape
                     foreach (String tmpKey in readList)
                     {
                         if (!writeList.Contains(tmpKey))
-                        { 
+                        {
                             SW.WriteLine(tmpKey);
                         }
                         else
@@ -482,7 +550,7 @@ namespace mtape
 
                 String tmp = System.IO.File.ReadAllText("transDiff.trn");
                 tmp = lastWritten + Environment.NewLine + tmp;
-                System.IO.File.WriteAllText("transDiff.trn",tmp);
+                System.IO.File.WriteAllText("transDiff.trn", tmp);
 
                 // Remove the old transaction read file
                 System.IO.File.Delete("transRead.trn");
@@ -499,7 +567,7 @@ namespace mtape
         {
             Dummy("Append");
             uint retCode = 0;
-            if(!API.SeekToEOD(ref retCode))
+            if (!API.SeekToEOD(ref retCode))
             {
                 LogError("Append", "Error seeking to the end of data Error:" + retCode);
             }
@@ -617,7 +685,7 @@ namespace mtape
                     cmd.ExecuteNonQuery();
                 }
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 LogError("InitializeLibrary", "Failed to initialize the tape library Error:" + ex.Message);
             }
@@ -633,16 +701,16 @@ namespace mtape
         {
             bool retValue = true;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+
+            if (API.IsTapeOpen())
             {
                 int MAX_BUFFER = API.MaximumBlockSizeDrive; //1MB
                 int MIN_BUFFER = API.MinimumBlockSizeDrive;
@@ -685,8 +753,9 @@ namespace mtape
                                 case 1104:  //EOD reached
                                     LogError("ReadFile", "EOD detected");
                                     break;
-                                case 1100:  //EOT reached
-                                    LogError("ReadFile", "EOF detected.");
+                                case 1129:  // Physical EOT
+                                case 1100:  // EOT marker reached
+                                    LogError("ReadFile", "EOT detected.");
                                     Continue = NextTape();
                                     break;
                                 default:    //any other errors
@@ -732,7 +801,7 @@ namespace mtape
                 System.IO.FileInfo FI = new FileInfo(FileName);
                 return (int)((FI.Length / API.MaximumBlockSizeDrive) + 1);
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 return 0;
             }
@@ -772,7 +841,7 @@ namespace mtape
         {
             bool retValue = false;
             System.IO.FileInfo FI = new FileInfo(newTapeScript);
-            if(FI.Extension == ".bat")
+            if (FI.Extension == ".bat")
             {
                 retValue = true;
             }
@@ -787,12 +856,28 @@ namespace mtape
         {
             bool retValue = false;
             string[] text = System.IO.File.ReadAllLines(newTapeScript);
-            if(text[0].StartsWith("#!mtape"))
+            if (text[0].Trim().ToLower() == "#!mtape")
             {
                 retValue = true;
             }
             return retValue;
         }
+
+        /// <summary>
+        /// Determines if the script is an mTape script or not
+        /// </summary>
+        /// <returns>bool Is an mTape script</returns>
+        private static bool isScriptMtape2()
+        {
+            bool retValue = false;
+            string[] text = System.IO.File.ReadAllLines(newTapeScript);
+            if (text[0].Trim().ToLower() == "#!mtape2")
+            {
+                retValue = true;
+            }
+            return retValue;
+        }
+
 
         /// <summary>
         /// Keeps checking to see if the tape drive is read (i.e. tape loaded and ready to write)
@@ -801,29 +886,40 @@ namespace mtape
         private static bool DetectNewTape()
         {
             bool retValue = false;
-            bool tapeOpen = false;
+            bool tapeDetected = false;
 
-            
-            while (!tapeOpen)
+            if (!API.IsTapeOpen())
             {
-                try
+                if (!API.Open(@"\\.\" + API.TapeDrive))
                 {
-                    if (!API.Open(@"\\.\" + API.TapeDrive))
-                    {
-                        System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                        LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
-                    }
-                    else
-                    {
-                        tapeOpen = true;
-                    }
-                }
-                catch(Exception ex)
-                {
-
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
                 }
             }
-            API.Close();
+            if (API.IsTapeOpen())
+            {
+                LogMessage("DetectNewTape", "Looking for new tape.");
+                while (!tapeDetected)
+                {
+                    try
+                    {
+                        uint retCode = 0;
+                        if (getCurrentPosition() != -1)
+                        {
+                            tapeDetected = true;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        int errCode = (int)(uint)Marshal.GetLastWin32Error();
+                        if (errCode != TapeWinAPI.ERROR_NO_MEDIA_IN_DRIVE)
+                        {
+                            LogError("DetectNewTape", "Error detecting new tape Error:" + errCode);
+                        }
+                    }
+                    System.Threading.Thread.Sleep(500);
+                }
+            }
             return retValue;
         }
 
@@ -831,17 +927,17 @@ namespace mtape
         /// Removes double quotes from values
         /// </summary>
         /// <param name="Dictionary&lt;String,String&gt;source"></param>
-        private static void cleanVariables(ref Dictionary<String,String> source)
+        private static void cleanVariables(ref Dictionary<String, String> source)
         {
             Dictionary<String, String> tmp = new Dictionary<string, string>();
 
-            foreach(String tmpKey in source.Keys)
+            foreach (String tmpKey in source.Keys)
             {
                 String tmpString = source[tmpKey].Replace("\"", "");
-                tmp.Add(tmpKey,tmpString);
+                tmp.Add(tmpKey, tmpString);
             }
             source.Clear();
-            foreach(String tmpKey in tmp.Keys)
+            foreach (String tmpKey in tmp.Keys)
             {
                 source.Add(tmpKey, tmp[tmpKey]);
             }
@@ -867,18 +963,11 @@ namespace mtape
                     EnableSsl = true,
                 };
                 String tmpMessage = mVariables["MailMessage"];
-                if (mVariables["Reason"] == "NewTape")
-                {
-                    tmpMessage = tmpMessage.Replace("$Volume", (m_VolumeNumber + 1).ToString()).Replace("$VOLUME", (m_VolumeNumber + 1).ToString()).Replace("$REASON", "Newtape");
-                }
-                else
-                {
-                    tmpMessage = tmpMessage.Replace("$Volume", m_VolumeNumber.ToString()).Replace("$VOLUME", m_VolumeNumber.ToString()).Replace("$REASON", "Needed");
-                }
+                tmpMessage = tmpMessage.Replace("$Volume", "VOL_" + zeroFill(m_VolumeNumber,4)).Replace("$VOLUME", zeroFill(m_VolumeNumber,4)).Replace("$REASON", mVariables["$REASON"]);
                 smtpClient.Send(mVariables["MailSender"], mVariables["MailRecipient"], mVariables["MailSubject"], tmpMessage);
                 RetValue = true;
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 RetValue = false;
             }
@@ -896,12 +985,12 @@ namespace mtape
             string[] text = System.IO.File.ReadAllLines(newTapeScript);
             String regExPattern = "[A-Z$\\(\\)]+|(\\\"([^\\\"])*\\\")";
 
-            Regex rg = new Regex(regExPattern,RegexOptions.IgnoreCase);
+            Regex rg = new Regex(regExPattern, RegexOptions.IgnoreCase);
 
             Dictionary<String, String> mVariables = new Dictionary<string, string>();
             foreach (String tmpText in text)
             {
-                if(!tmpText.StartsWith("#") && tmpText.Trim() != string.Empty)
+                if (!tmpText.StartsWith("#") && tmpText.Trim() != string.Empty)
                 {
                     MatchCollection matches = rg.Matches(tmpText);
                     if (matches.Count > 0)
@@ -910,14 +999,14 @@ namespace mtape
                         {
                             case "eject()":
                                 // Commented out for testing purposes
-//                                EJECT();
+                                //                                EJECT();
                                 break;
                             case "keypress()":
                                 System.Console.ReadKey();
                                 break;
                             case "detectnewtape()":
                                 LogMessage("runMTapeScript", "Detecting new tape in drive.");
-                                if(!DetectNewTape())
+                                if (!DetectNewTape())
                                 {
                                     return false;
                                 }
@@ -925,15 +1014,15 @@ namespace mtape
                                 break;
                             case "sendmail()":
                                 LogMessage("runMTapeScript", "Sending email");
-                                if(newTape)
+                                if (!mVariables.ContainsKey("Reason"))
                                 {
-                                    mVariables.Add("Reason", "NewTape");
+                                    mVariables.Add("Reason", mVariables["$REASON"]);
                                 }
                                 else
                                 {
-                                    mVariables.Add("Reason", "Needed");
+                                    mVariables["Reason"] = mVariables["$REASON"];
                                 }
-                                if(!SendMail(mVariables))
+                                if (!SendMail(mVariables))
                                 {
                                     return false;
                                 }
@@ -942,16 +1031,16 @@ namespace mtape
                             case "print":
                                 if (newTape)
                                 {
-                                    LogMessage(newTapeScript, matches[1].Value.Replace("\"", "").Replace("$VOLUME", (m_VolumeNumber + 1).ToString()).Replace("$REASON", "Newtape"));
+                                    LogMessage(newTapeScript, matches[1].Value.Replace("\"", "").Replace("$VOLUME", "VOL_" + zeroFill(m_VolumeNumber,4)).Replace("$REASON", "Newtape"));
                                 }
                                 else
                                 {
-                                    LogMessage(newTapeScript, matches[1].Value.Replace("\"", "").Replace("$VOLUME", (m_VolumeNumber).ToString()).Replace("$REASON", "Needed"));
+                                    LogMessage(newTapeScript, matches[1].Value.Replace("\"", "").Replace("$VOLUME", "VOL_" + zeroFill(m_VolumeNumber,4)).Replace("$REASON", "Needed"));
                                 }
                                 break;
                             case "call":
                                 // Calls external application or script
-                                if(!RunExternal(out retCode, "runMTapeScript"))
+                                if (!RunExternal(out retCode, "runMTapeScript"))
                                 {
                                     LogMessage("runMTapeScript", "External command reported an error :" + retCode);
                                     return false;
@@ -1014,11 +1103,11 @@ namespace mtape
                     // send command to its input
                     if (newTape)
                     {
-                        p.StandardInput.Write(newTapeScript + " " + m_VolumeNumber + 1 + " New" + p.StandardInput.NewLine);
+                        p.StandardInput.Write(newTapeScript + " VOL_" + zeroFill(m_VolumeNumber,4) + " New" + p.StandardInput.NewLine);
                     }
                     else
                     {
-                        p.StandardInput.Write(newTapeScript + " " + m_VolumeNumber + " Needed" + p.StandardInput.NewLine);
+                        p.StandardInput.Write(newTapeScript + " VOL_" + zeroFill(m_VolumeNumber,4) + " Needed" + p.StandardInput.NewLine);
                     }
                     //wait
                     p.WaitForExit();
@@ -1035,15 +1124,61 @@ namespace mtape
             }
         }
 
+
+        /// <summary>
+        /// Logs an error.
+        /// </summary>
+        /// <param name="String Command">The command issuing the error</param>
+        /// <param name="String Error" type="string">The comment to add to the error log</param>
+        static private void LogError(String Command, String Error)
+        {
+            if (m_ErrorLog != string.Empty)
+            {
+                if (!System.IO.File.Exists(m_ErrorLog))
+                {
+                    var fs = System.IO.File.Create(m_ErrorLog);
+                    fs.Close();
+                }
+                using (System.IO.StreamWriter SW = System.IO.File.AppendText(m_ErrorLog))
+                {
+                    SW.WriteLine("[" + DateTime.Now.ToShortDateString() + " " + DateTime.Now.ToShortTimeString() + " - " + Command + "] " + Error);
+                }
+                System.Console.WriteLine("[" + Command + "] " + Error);
+            }
+        }
+
+        /// <summary>
+        /// Logs a message.
+        /// </summary>
+        /// <param name="String Command"></param>
+        /// <param name="String Message" type="string"></param>       
+        static private void LogMessage(String Command, String Message)
+        {
+            if (m_LogFile != string.Empty)
+            {
+                if (!System.IO.File.Exists(m_LogFile))
+                {
+                    var fs = System.IO.File.Create(m_LogFile);
+                    fs.Close();
+                }
+                using (System.IO.StreamWriter SW = System.IO.File.AppendText(m_LogFile))
+                {
+                    SW.WriteLine("[" + DateTime.Now.ToShortDateString() + " " + DateTime.Now.ToShortTimeString() + " - " + Command + "] " + Message);
+                }
+            }
+            System.Console.WriteLine("[" + Command + "] " + Message);
+        }
+
+
         /// <summary>
         /// Executes an mtape script or batch file
         /// </summary>
         /// <param name="Ref int RetCode"></param>
         /// <returns>bool Success</returns>
-        private static bool CallScript(out int RetCode, bool newTape = false)
+        private static bool CallScript(out int RetCode, bool newTape = false, int ReasonCode = 0)
         {
             bool retValue = false;
-
+            int retCode = 0;
             if (isScriptBatch())
             {
                 retValue = RunExternal(out RetCode, "CallScript", newTape);
@@ -1052,17 +1187,32 @@ namespace mtape
             {
                 if (isScriptMtape())
                 {
+                    LogMessage("CallScript", "MTape Script v1");
                     runMTapeScript(newTape);
+                    retValue = true;
                     // Call my own scripting language
                 }
                 else
                 {
-                    LogError("CallScript", "Unknown scripting type... if PowerShell or other scripting language, call from a batch file.");
+                    if (isScriptMtape2())
+                    {
+                        LogMessage("CallScript", "MTape Script v2");
+                        if (newTape)
+                        {
+                            runMTapeScript(NewTape, newTapeScript, out retCode, "");
+                        }
+                        else
+                        {
+                            runMTapeScript(ReasonCode, newTapeScript, out retCode, "");
+                        }
+                    }
+                    retValue = true;
                 }
             }
-            RetCode = 0;
+            RetCode = retCode;
             return retValue;
         }
+
 
         /// <summary>
         /// Executed if a new tape is required....optional user script can be executed as well.
@@ -1070,18 +1220,22 @@ namespace mtape
         /// <returns>bool success</returns>
         private static bool NextTape(bool newTape = true)
         {
-            bool retValue = true;
+            bool retValue = false;
 
+            LogMessage("NextTape", "Starting NextTape");
             // Ejecting tape
             if (newTape)
             {
+                LogMessage("NextTape", "newTape set");
                 EJECT();
             }
-            if(newTapeScript != string.Empty)
+
+            if (newTapeScript != string.Empty)
             {
                 int retCode = 0;
                 //  Will need to return 0 (true) or -1 (false) to continue or not.
-                if (!CallScript(out retCode,newTape))
+                LogMessage("NextTape", "Calling script");
+                if (!CallScript(out retCode, newTape))
                 {
                     LogError("NextTape", "Error calling script " + retCode);
                 }
@@ -1090,18 +1244,18 @@ namespace mtape
             {
                 if (newTape)
                 {
-                    LogMessage("Next Tape", "Tape is full...please insert the next volume (" + m_VolumeNumber + 1 + ") and press any key.");
-                    m_VolumeNumber++;
+                    LogMessage("Next Tape", "Tape is full...please insert the next volume (VOL_" + zeroFill(m_VolumeNumber,4) + ") and press any key.");
                 }
                 else
                 {
-                    LogMessage("Next Tape", "Tape needed for restore...please insert volume (" + m_VolumeNumber + ") and press any key.");
+                    LogMessage("Next Tape", "Tape needed for restore...please insert volume (VOL_" + zeroFill(m_VolumeNumber,4) + ") and press any key.");
                 }
                 System.Console.ReadKey();
                 // Load the new Tape.
                 if (newTape)
                 {
                     Load();
+                    m_VolumeNumber++;
                 }
                 retValue = true;
             }
@@ -1121,7 +1275,7 @@ namespace mtape
             {
                 createTables = true;
             }
-            
+
             string cs = @"URI=file:" + dbName;
 
             retValue = new SQLiteConnection(cs);
@@ -1129,7 +1283,7 @@ namespace mtape
             {
                 SQLiteConnection.CreateFile(dbName);
             }
-            
+
             retValue.Open();
             if (createTables)
             {
@@ -1155,16 +1309,16 @@ namespace mtape
             SQLiteConnection conn = ConnectDatabase();
             if (conn.State == System.Data.ConnectionState.Open)
             {
-                SQLiteCommand cmd = new SQLiteCommand("SELECT name FROM sqlite_schema WHERE type='table' and name = 'Files' ORDER BY name",conn);
+                SQLiteCommand cmd = new SQLiteCommand("SELECT name FROM sqlite_schema WHERE type='table' and name = 'Files' ORDER BY name", conn);
                 SQLiteDataReader rdr = cmd.ExecuteReader();
                 if (rdr.HasRows)
                 {
-                    cmd = new SQLiteCommand("select * from Files where Name = @name",conn);
+                    cmd = new SQLiteCommand("select * from Files where Name = @name", conn);
                     cmd.Parameters.AddWithValue("@name", Filename);
                     SQLiteDataReader rdr2 = cmd.ExecuteReader();
                     if (rdr2.HasRows)
                     {
-                        cmd = new SQLiteCommand("update Files set Deleted = @deleted",conn);
+                        cmd = new SQLiteCommand("update Files set Deleted = @deleted", conn);
                         cmd.Parameters.AddWithValue("@deleted", true);
                         cmd.ExecuteNonQuery();
                         retValue = true;
@@ -1186,6 +1340,17 @@ namespace mtape
             return retValue;
         }
 
+        private static String zeroFill(int NumberToFill, int Width)
+        {
+            string retValue = NumberToFill.ToString();
+            while(retValue.Length < Width)
+            {
+                retValue = "0" + retValue;
+            }
+
+            return retValue;
+        }
+
         /// <summary>
         /// Adds the volume to the tape library
         /// </summary>
@@ -1201,18 +1366,18 @@ namespace mtape
                 if (rdr.HasRows)
                 {
                     cmd = new SQLiteCommand("select * from Volumes where Name = @name", conn);
-                    cmd.Parameters.AddWithValue("@name", "VOL_" + m_VolumeNumber.ToString());
+                    cmd.Parameters.AddWithValue("@name", "VOL_" + zeroFill(m_VolumeNumber,4));
                     SQLiteDataReader rdr2 = cmd.ExecuteReader();
                     if (!rdr2.HasRows)
                     {
                         cmd = new SQLiteCommand("insert into Volumes (Name) values(@name)", conn);
-                        cmd.Parameters.AddWithValue("@name", "VOL_" + m_VolumeNumber.ToString());
+                        cmd.Parameters.AddWithValue("@name", "VOL_" + zeroFill(m_VolumeNumber,4));
                         cmd.ExecuteNonQuery();
                         retValue = true;
                     }
                     else
                     {
-                        LogError("addVolumeToDatabase", "Specified volume is already in the database '" + "VOL_" + m_VolumeNumber.ToString() + "'");
+                        LogError("addVolumeToDatabase", "Specified volume is already in the database '" + "VOL_" + zeroFill(m_VolumeNumber, 4) + "'");
                         retValue = false;
                     }
                     rdr2.Close();
@@ -1236,18 +1401,18 @@ namespace mtape
         {
             bool retValue = false;
             SQLiteConnection conn = ConnectDatabase();
-            if(conn.State == System.Data.ConnectionState.Open)
+            if (conn.State == System.Data.ConnectionState.Open)
             {
-                SQLiteCommand cmd = new SQLiteCommand("SELECT name FROM sqlite_schema WHERE type='table' and name = 'Files' ORDER BY name",conn);
+                SQLiteCommand cmd = new SQLiteCommand("SELECT name FROM sqlite_schema WHERE type='table' and name = 'Files' ORDER BY name", conn);
                 SQLiteDataReader rdr = cmd.ExecuteReader();
-                if(rdr.HasRows)
+                if (rdr.HasRows)
                 {
-                    cmd = new SQLiteCommand("select * from Files where Name = @name",conn);
+                    cmd = new SQLiteCommand("select * from Files where Name = @name", conn);
                     cmd.Parameters.AddWithValue("@name", Filename);
                     SQLiteDataReader rdr2 = cmd.ExecuteReader();
                     if (!rdr2.HasRows)
                     {
-                        cmd = new SQLiteCommand("insert into Files (Name,Directory,Volume,FileDate,Size,Position,Deleted) values(@name, @directory, @volume, @date, @size,@position, @deleted)",conn);
+                        cmd = new SQLiteCommand("insert into Files (Name,Directory,Volume,FileDate,Size,Position,Deleted) values(@name, @directory, @volume, @date, @size,@position, @deleted)", conn);
                         System.IO.FileInfo FI = new FileInfo(Filename);
 
                         cmd.Parameters.AddWithValue("@name", FI.Name);
@@ -1282,26 +1447,49 @@ namespace mtape
         /// </summary>
         /// <param name="string filename"></param>
         /// <returns>bool Success</returns>        
-        private static bool WriteFile(String Filename)
+        private static bool WriteFile(String Filename, Boolean SupressMessages = false, Boolean AddToDatabase = true)
         {
             bool retValue = true;
             bool tapeOpen = false;
+            int tmpCode = 0;
             m_CurrentPosition = getCurrentPosition();
-            if(m_Count != 0)
+
+            // If the override psoition != -1 then use it.
+            if(m_OverridePosition != -1)
             {
-                LogMessage("WriteFile", "Seeking to the specified location before writing.");
-                SEEKL((long)m_Count);
+                m_CurrentPosition = m_OverridePosition;
             }
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+
+            // If not adding to the database (i.e. JSO file header) capture the override position.
+            // The intent is that the database record points to the header and not the physical file.
+            if(!AddToDatabase)
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                m_OverridePosition = m_CurrentPosition;
             }
             else
             {
-                tapeOpen = true;
+                m_OverridePosition = -1;
             }
-            if (tapeOpen)
+            if (m_Count != 0)
+            {
+                if (!SupressMessages)
+                {
+                    LogMessage("WriteFile", "Seeking to the specified location before writing.");
+                }
+                SEEKL((long)m_Count);
+            }
+            if (!API.IsTapeOpen())
+            {
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    if (!SupressMessages)
+                    {
+                        LogMessage("WriteFile", "Tape drive:" + @"\\.\" + API.TapeDrive);
+                        LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                    }
+                }
+            }
+            if (API.IsTapeOpen())
             {
                 int MAX_BUFFER = API.MaximumBlockSizeDrive; //1MB
                 int MIN_BUFFER = API.MinimumBlockSizeDrive;
@@ -1323,43 +1511,57 @@ namespace mtape
                         uint retCode = 0;
                         if (!API.Write(ref buffer, (uint)bytesRead, ref bytesWritten, ref retCode))
                         {
-                            LogError("WriteFile", "Error writing to tape " + new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
-                            break;
-                        }
-                        else
-                        {
                             switch (retCode)
                             {
+                                case 1112:  // Not media in drive
+                                    LogError("WriteFile", "There is no tape in the drive.");
+                                    Environment.Exit(1);
+                                    break;
                                 case 0234:  //more data is available
                                             //update error log and status
                                     LogError("WriteFile", "aborted due to SCSI Controller problem");
+                                    runMTapeScript(Alert, newTapeScript, out tmpCode, "Aborted due to SCSI Controller problem.");
                                     break;
                                 case 1106:  //incorrect block size
                                             //update error log and status
                                     LogError("WriteFile", "aborted due to invalid block size");
+                                    runMTapeScript(Alert, newTapeScript, out tmpCode, "Aborted due to invalid block size.");
                                     break;
-                                case 1100:  //EOT reached
-                                    LogError("WriteFile", "EOF detected.");
-                                    if(NextTape())
+                                case 1129:  // Physical end of tape
+                                case 1100:  // EOT Marker reached
+                                    LogError("WriteFile", "EOT detected.");
+                                    LogError("WriteFile", "Calling NextTape");
+                                    if (NextTape())
                                     {
+                                        LogError("WriteFile", "Adding volume");
+                                        m_VolumeNumber++;
                                         addVolumeToDatabase();
                                         continue;
                                     }
                                     break;
+                                case 1156:  // Device Requires Cleaning
+                                    LogMessage("WriteFile", "Tape Drive Requires Cleaning.");
+                                    runMTapeScript(Clean, newTapeScript, out tmpCode, "Tape drive requires cleaning.");
+                                    break;
+                                case 1110:  // Media Changed (normal if new tape was inserted.
+                                    continue;
                                 case 0:
                                     break;
                                 default:    //any other errors
                                     LogError("WriteFile", "aborted with error code: " + retCode.ToString());
+                                    runMTapeScript(Alert, newTapeScript, out tmpCode, "Aborted Error Code:" + retCode.ToString());
                                     break;
                             }
                         }
-                        
+
                     }
                 }
-                LogMessage("WriteFile", "File was written to tape");
                 // Write End of File marker
                 EOF();
-                AddFileToDatabase(Filename);
+                if (AddToDatabase)
+                {
+                    AddFileToDatabase(Filename);
+                }
             }
             else
             {
@@ -1367,6 +1569,141 @@ namespace mtape
             }
             return retValue;
         }
+
+        /// <summary>
+        /// Writes a single file to the tape drive
+        /// </summary>
+        /// <param name="string filename"></param>
+        /// <returns>bool Success</returns>        
+        private static bool WriteFileWithCompression(String Filename, Boolean SupressMessages = false, Boolean AddToDatabase = true)
+        {
+            bool retValue = true;
+            bool tapeOpen = false;
+            
+
+            m_CurrentPosition = getCurrentPosition();
+
+            // If the override psoition != -1 then use it.
+            if (m_OverridePosition != -1)
+            {
+                m_CurrentPosition = m_OverridePosition;
+            }
+
+            // If not adding to the database (i.e. JSO file header) capture the override position.
+            // The intent is that the database record points to the header and not the physical file.
+            if (!AddToDatabase)
+            {
+                m_OverridePosition = m_CurrentPosition;
+            }
+            else
+            {
+                m_OverridePosition = -1;
+            }
+            if (m_Count != 0)
+            {
+                if (!SupressMessages)
+                {
+                    LogMessage("WriteFile", "Seeking to the specified location before writing.");
+                }
+                SEEKL((long)m_Count);
+            }
+            if (!API.IsTapeOpen())
+            {
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    if (!SupressMessages)
+                    {
+                        LogMessage("WriteFile", "Tape drive:" + @"\\.\" + API.TapeDrive);
+                        LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                    }
+                }
+            }
+            if (API.IsTapeOpen())
+            {
+                int MAX_BUFFER = API.MaximumBlockSizeDrive; //1MB
+                int MIN_BUFFER = API.MinimumBlockSizeDrive;
+                int tmpOut = 0;
+                byte[] buffer = new byte[MAX_BUFFER];
+                int bytesRead;
+                int noOfFiles = 0;
+
+                int chunksRequired = FileChunkCount(Filename);
+
+
+                using (FileStream fs = File.Open(Filename, FileMode.Open, FileAccess.Read))
+                using (MemoryStream CompressedFileStream = new MemoryStream())
+                using (var Compressor = new GZipStream(CompressedFileStream,CompressionMode.Compress, true))
+                using (BufferedStream bs = new BufferedStream(fs))
+                {
+                    fs.CopyTo(Compressor);
+                    while ((bytesRead = Compressor.Read(buffer, 0, MAX_BUFFER)) != 0) //reading 1mb chunks at a time
+
+//                        while ((bytesRead = bs.Read(buffer, 0, MAX_BUFFER)) != 0) //reading 1mb chunks at a time
+                    {
+                        noOfFiles++;
+                        uint bytesWritten = 0;
+                        uint retCode = 0;
+                        if (!API.Write(ref buffer, (uint)bytesRead, ref bytesWritten, ref retCode))
+                        {
+                            switch (retCode)
+                            {
+                                case 1112:  // Not media in drive
+                                    LogError("WriteFile", "There is no tape in the drive.");
+                                    Environment.Exit(1);
+                                    break;
+                                case 0234:  //more data is available
+                                            //update error log and status
+                                    LogError("WriteFile", "aborted due to SCSI Controller problem");
+                                    runMTapeScript(Alert, newTapeScript, out tmpOut, "Aborted due to SCSI Controller problem.");
+
+                                    break;
+                                case 1106:  //incorrect block size
+                                            //update error log and status
+                                    LogError("WriteFile", "aborted due to invalid block size");
+                                    runMTapeScript(Alert, newTapeScript, out tmpOut, "Aborted due to invalid block size.");
+                                    break;
+                                case 1129:  // Physical end of tape
+                                case 1100:  // EOT Marker reached
+                                    LogError("WriteFile", "EOT detected.");
+                                    if (NextTape())
+                                    {
+                                        m_VolumeNumber++;
+                                        addVolumeToDatabase();
+                                        continue;
+                                    }
+                                    break;
+                                case 1156:  // Device Requires Cleaning
+                                    LogMessage("WriteFile", "Tape Drive Requires Cleaning.");
+                                    runMTapeScript(Clean, newTapeScript, out tmpOut, "Tape drive requires cleaning.");
+                                    break;
+
+                                case 1110:  // Media Changed (normal if new tape was inserted.
+                                    continue;
+                                case 0:
+                                    break;
+                                default:    //any other errors
+                                    LogError("WriteFile", "aborted with error code: " + retCode.ToString());
+                                    runMTapeScript(Alert, newTapeScript, out tmpOut, "Aborted Error Code:" + retCode.ToString());
+                                    break;
+                            }
+                        }
+
+                    }
+                }
+                // Write End of File marker
+                EOF();
+                if (AddToDatabase)
+                {
+                    AddFileToDatabase(Filename);
+                }
+            }
+            else
+            {
+                LogError("WriteFile", "Unable to open tape drive");
+            }
+            return retValue;
+        }
+
 
         /// <summary>
         /// retrieves a list of files from the specified folder
@@ -1398,7 +1735,7 @@ namespace mtape
                 transRead.Flush();
                 transRead.Close();
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 LogError("getFiles", "Error reading directory (" + path + ") error:" + ex.Message);
             }
@@ -1413,7 +1750,7 @@ namespace mtape
         /// <returns>Altered string</returns>
         private static string truncateRight(String inString, int maxWidth)
         {
-            if(inString.Length > maxWidth)
+            if (inString.Length > maxWidth)
             {
                 return inString.Substring(0, maxWidth);
             }
@@ -1438,7 +1775,7 @@ namespace mtape
                 int origRow = Console.CursorTop;
                 int origCol = Console.CursorLeft;
 
-                System.Console.Write(truncateRight(startDir, Console.WindowWidth-5));
+                System.Console.Write(truncateRight(startDir, Console.WindowWidth - 5));
                 System.Console.SetCursorPosition(origCol, origRow);
                 string[] tmpDirs = new string[0];
                 try
@@ -1449,7 +1786,7 @@ namespace mtape
                     Array.Resize(ref retValue, retValue.Length + wrkFiles.Length);
                     wrkFiles.CopyTo(retValue, oldSize);
                 }
-                catch(Exception ex)
+                catch (Exception ex)
                 {
                     LogError("getDirs", "Error reading files from directory (" + startDir + ")");
                 }
@@ -1462,7 +1799,7 @@ namespace mtape
                     wrkValue.CopyTo(retValue, oldSize);
                 }
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 LogError("getDirs", "Error reading directory (" + startDir + ") error:" + ex.Message);
             }
@@ -1478,6 +1815,15 @@ namespace mtape
             FileAttributes attr = File.GetAttributes(m_Filename);
             System.IO.FileInfo FI = new FileInfo(m_Filename);
 
+            if (newTapeScript != string.Empty)
+            {
+                int retCode = 0;
+                //  Will need to return 0 (true) or -1 (false) to continue or not.
+                int tmpOut = 0;
+                runMTapeScript(StartBackup,newTapeScript, out tmpOut, "");
+                addVolumeToDatabase();
+            }
+
             System.Console.WriteLine("Filename\\path to write to tape:" + m_Filename);
             if (attr.HasFlag(FileAttributes.Directory))
             {
@@ -1486,10 +1832,10 @@ namespace mtape
                 LogMessage("WriteTape", "Collecting files to write....this may take a while.");
 
 
-                
+
                 System.IO.FileStream theFile = System.IO.File.Create("transRead.trn");
                 theFile.Close();
-                
+
                 String[] files = new String[0];
 
                 LogMessage("WriteTape", "Reading directory (" + m_Filename + ")");
@@ -1507,6 +1853,7 @@ namespace mtape
                     foreach (String tmpFile in files)
                     {
                         LogMessage("WriteTape", "Writing file (" + tmpFile + ")");
+                        WriteFileHeader(tmpFile);
                         WriteFile(tmpFile);
                         transWrite.WriteLine(tmpFile);
                     }
@@ -1514,9 +1861,17 @@ namespace mtape
             }
             else
             {
+                WriteFileHeader(FI.FullName);
                 WriteFile(FI.FullName);
             }
+            if (newTapeScript != string.Empty)
+            {
+                int retCode = 0;
+                //  Will need to return 0 (true) or -1 (false) to continue or not.
+                runMTapeScript(EndBackup, newTapeScript, out retCode, "");
+            }
         }
+
 
         /// <summary>
         /// FUTURE: Command to locate a file in the library, if required prompts for volume to be loaded and then reads the file from the tape.
@@ -1526,12 +1881,12 @@ namespace mtape
             SQLiteConnection conn = ConnectDatabase();
             if (conn.State == System.Data.ConnectionState.Open)
             {
-                SQLiteCommand cmd = new SQLiteCommand("SELECT name FROM sqlite_schema WHERE type='table' and name = 'Files' ORDER BY name",conn);
+                SQLiteCommand cmd = new SQLiteCommand("SELECT name FROM sqlite_schema WHERE type='table' and name = 'Files' ORDER BY name", conn);
                 SQLiteDataReader rdr = cmd.ExecuteReader();
                 if (rdr.HasRows)
                 {
                     System.IO.FileInfo FI = new FileInfo(m_Filename);
-                    cmd = new SQLiteCommand("select Volume, Position from Files where Name = @name and Directory = @directory",conn);
+                    cmd = new SQLiteCommand("select Volume, Position from Files where Name = @name and Directory = @directory", conn);
                     cmd.Parameters.AddWithValue("@name", FI.Name);
                     cmd.Parameters.AddWithValue("@directory", FI.DirectoryName);
                     SQLiteDataReader rdr2 = cmd.ExecuteReader();
@@ -1587,27 +1942,6 @@ namespace mtape
             System.Console.WriteLine(cmd + " is not currently implemented.");
         }
 
-        
-
-        /// <summary>
-        /// Logs an error.
-        /// </summary>
-        /// <param name="String Command">The command issuing the error</param>
-        /// <param name="String Error" type="string">The comment to add to the error log</param>
-        private static void LogError(String Command,String Error)
-        {
-            System.Console.WriteLine("[" + Command + "] " + Error);
-        }
-
-        /// <summary>
-        /// Logs a message.
-        /// </summary>
-        /// <param name="String Command"></param>
-        /// <param name="String Message" type="string"></param>       
-        private static void LogMessage(String Command,String Message)
-        {
-            System.Console.WriteLine("[" + Command + "] " + Message);
-        }
 
         /// <summary>
         /// Media Parameters structure
@@ -1629,17 +1963,16 @@ namespace mtape
         private static void Info()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
-            }
-            else
-            {
-                tapeOpen = true;
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
 
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 try
                 {
@@ -1674,7 +2007,7 @@ namespace mtape
                     System.Console.WriteLine("Partition Count      : [" + partcount + "]");
                     System.Console.WriteLine("Write protected      : [" + isWriteProtected + "]");
                 }
-                catch(Exception ex)
+                catch (Exception ex)
                 {
                     int errCode = (int)(uint)Marshal.GetLastWin32Error();
                     if (errCode == TapeWinAPI.ERROR_NO_MEDIA_IN_DRIVE)
@@ -1686,8 +2019,6 @@ namespace mtape
                         LogError("Info", "Error " + ex.Message);
                     }
                 }
-                API.Close();
-
             }
             else
             {
@@ -1721,10 +2052,10 @@ namespace mtape
                     {
                         LogMessage("Status", "Tape Library Contents");
                         LogMessage("Status", "");
-                        LogMessage("Status", padRight("Directory",50) + padRight("File Name", 20) + padRight("Volume ID", 15) + padRight("File Date", 40) + padRight("File Size", 15) + padRight("Tape Position", 15));
+                        LogMessage("Status", padRight("Directory", 50) + padRight("File Name", 20) + padRight("Volume ID", 15) + padRight("File Date", 40) + padRight("File Size", 15) + padRight("Tape Position", 15));
                         int recCount = 0;
                         int delCount = 0;
-                        
+
                         List<String> volumes = new List<string>();
 
                         while (rdr2.Read())
@@ -1743,7 +2074,7 @@ namespace mtape
                                         dirName = rdr2.GetString(i);
                                         break;
                                     case "Volume":
-                                        VolumeID = "VOL_" + rdr2.GetInt32(i).ToString();
+                                        VolumeID = "VOL_" + zeroFill(rdr2.GetInt32(i), 4);
                                         break;
                                     case "FileDate":
                                         FileDate = rdr2.GetString(i);
@@ -1781,7 +2112,7 @@ namespace mtape
                                 {
                                     dirName = dirName.Substring(0, 50);
                                 }
-                                LogMessage("Status", padRight(dirName,50) + padRight(fileName, 20) + padRight(VolumeID, 15) + padRight(FileDate, 40) + padRight(FileSize, 15) + padRight(TapePosition, 15));
+                                LogMessage("Status", padRight(dirName, 50) + padRight(fileName, 20) + padRight(VolumeID, 15) + padRight(FileDate, 40) + padRight(FileSize, 15) + padRight(TapePosition, 15));
                             }
                         }
                         LogMessage("Status", "");
@@ -1803,26 +2134,25 @@ namespace mtape
             }
             conn.Close();
         }
-        
+
         /// <summary>
         /// Lock the drive
         /// </summary>
         private static void Lock()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 uint retCode = 0;
-                if(!API.Lock(ref retCode))
+                if (!API.Lock(ref retCode))
                 {
                     LogError("Lock", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
                 }
@@ -1830,7 +2160,6 @@ namespace mtape
                 {
                     LogMessage("Lock", "Tape drive door locked.");
                 }
-                API.Close();
             }
             else
             {
@@ -1845,16 +2174,15 @@ namespace mtape
         private static void Unlock()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 uint retCode = 0;
                 if (!API.Unlock(ref retCode))
@@ -1865,7 +2193,6 @@ namespace mtape
                 {
                     LogMessage("Unlock", "Tape drive door is unlockec.");
                 }
-                API.Close();
             }
             else
             {
@@ -1879,25 +2206,24 @@ namespace mtape
         private static void FSF()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 uint retcode = 0;
-                if (API.SpaceFileMarks(m_Count,ref retcode))
+                if (API.SpaceFileMarks(m_Count, ref retcode))
                 {
                     LogMessage("FSF", "Ok");
                 }
                 else
                 {
-                    if(retcode == TapeWinAPI.ERROR_NO_DATA_DETECTED)
+                    if (retcode == TapeWinAPI.ERROR_NO_DATA_DETECTED)
                     {
                         LogError("FSF", "No data detected on drive.");
                     }
@@ -1906,7 +2232,6 @@ namespace mtape
                         LogError("FSF", "Undefined error code " + retcode);
                     }
                 }
-                API.Close();
             }
             else
             {
@@ -1920,16 +2245,15 @@ namespace mtape
         private static void BSF()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 uint retcode = 0;
                 if (API.SpaceFileMarks(m_Count * -1, ref retcode))
@@ -1947,30 +2271,28 @@ namespace mtape
                         LogError("BSF", "Undefined error code " + retcode);
                     }
                 }
-                API.Close();
             }
             else
             {
                 LogError("FSF", "Unable to open tape drive");
             }
         }
-        
+
         /// <summary>
         /// Forward space set mark(s)
         /// </summary>
         private static void FSS()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 uint retcode = 0;
                 if (API.SpaceBlocks(m_Count, ref retcode))
@@ -1988,7 +2310,6 @@ namespace mtape
                         LogError("FSS", "Undefined error code " + retcode);
                     }
                 }
-                API.Close();
             }
             else
             {
@@ -2002,16 +2323,15 @@ namespace mtape
         private static void BSS()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 uint retcode = 0;
                 if (API.SpaceFileMarks(m_Count * -1, ref retcode))
@@ -2029,7 +2349,6 @@ namespace mtape
                         LogError("BSS", "Undefined error code " + retcode);
                     }
                 }
-                API.Close();
             }
             else
             {
@@ -2043,16 +2362,15 @@ namespace mtape
         private static void FSFM()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 uint retcode = 0;
                 if (API.SpaceFileMarks(m_Count, ref retcode))
@@ -2085,7 +2403,6 @@ namespace mtape
                         LogError("FSFM", "Undefined error code " + retcode);
                     }
                 }
-                API.Close();
             }
             else
             {
@@ -2124,16 +2441,15 @@ namespace mtape
         private static void Rewind()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 uint retCode = 0;
                 if (!API.Rewind(ref retCode))
@@ -2168,16 +2484,15 @@ namespace mtape
         {
             uint retCode = 0;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 if (!API.SeekToEOD(ref retCode))
                 {
@@ -2201,24 +2516,30 @@ namespace mtape
         {
             uint retCode = 0;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
-            }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
-            {
-                if (!API.Unload(ref retCode))
+                if (!API.Open(@"\\.\" + API.TapeDrive))
                 {
-                    LogError("Eject", "Error unloading tape " + retCode);
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
+            }
+            if (API.IsTapeOpen())
+            {
+                if (!API.Rewind(ref retCode))
+                {
+                    LogError("Eject", "Error rewinding tape " + retCode);
                 }
                 else
                 {
-                    LogMessage("Eject", "Tape ejected.");
+                    if (!API.Unload(ref retCode))
+                    {
+                        LogError("Eject", "Error unloading tape " + retCode);
+                    }
+                    else
+                    {
+                        LogMessage("Eject", "Tape ejected.");
+                    }
                 }
             }
             else
@@ -2226,7 +2547,7 @@ namespace mtape
                 LogError("Eject", "Unable to connect to tape drive");
             }
         }
-        
+
         /// <summary>
         /// Retention the tape in the drive....long process
         /// </summary>
@@ -2234,16 +2555,15 @@ namespace mtape
         {
             uint retCode = 0;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 if (!API.AdjustTension(ref retCode))
                 {
@@ -2267,29 +2587,71 @@ namespace mtape
         private static void EOF()
         {
             uint retCode = 0;
+            int tmpOut = 0;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 int newCount = m_Count;
                 newCount = newCount == 0 ? 1 : newCount;
-
-                if (!API.WriteTapemark((uint) newCount, TapeWinAPI.TAPE_FILEMARKS,ref retCode))
+                Boolean EOFWritten = false;
+                do
                 {
-                    LogError("EOF", "Error writing EOF mark " + retCode);
+                    if (API.WriteTapemark((uint)newCount, TapeWinAPI.TAPE_FILEMARKS, ref retCode))
+                    {
+                        EOFWritten = true;
+                    }
+                    else
+                    {
+                        switch (retCode)
+                        {
+                            case 0234:  //more data is available
+                                        //update error log and status
+                                LogError("EOF", "aborted due to SCSI Controller problem");
+                                runMTapeScript(Alert, newTapeScript, out tmpOut, "Aborted due to SCSI Controller problem.");
+                                break;
+                            case 1106:  //incorrect block size
+                                        //update error log and status
+                                LogError("EOF", "aborted due to invalid block size");
+                                runMTapeScript(Alert, newTapeScript, out tmpOut, "Aborted due to invalid block size.");
+                                break;
+                            case 1129:  // Physical EOT
+                            case 1100:  // EOT marker reached
+                                LogError("EOT", "EOT detected.");
+                                if (NextTape())
+                                {
+                                    m_VolumeNumber++;
+                                    addVolumeToDatabase();
+                                    continue;
+                                }
+                                break;
+                            case 1110:  // Media Changed (normal if new tape was inserted.
+                                continue;
+                            case 1156:  // Device Requires Cleaning
+                                LogMessage("EOF", "Tape Drive Requires Cleaning.");
+                                runMTapeScript(Clean, newTapeScript, out tmpOut, "Tape drive requires cleaning.");
+                                break;
+                            case 1112:
+                                LogError("EOF", "There is no tape in the drive.");
+                                Environment.Exit(1);
+                                break;
+                            case 0:
+                                break;
+                            default:    //any other errors
+                                LogError("EOF", "aborted with error code: " + retCode.ToString());
+                                runMTapeScript(Alert, newTapeScript, out tmpOut, "Aborted Error:" + retCode.ToString());
+                                break;
+                        }
+                    }
                 }
-                else
-                {
-                    LogMessage("EOF", "Wrote EOF mark.");
-                }
+                while (!EOFWritten);
             }
             else
             {
@@ -2304,16 +2666,15 @@ namespace mtape
         {
             uint retCode = 0;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 if (!API.WriteTapemark((uint)m_Count, TapeWinAPI.TAPE_SETMARKS, ref retCode))
                 {
@@ -2338,18 +2699,17 @@ namespace mtape
         {
             uint retCode = 0;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
+            if (API.IsTapeOpen())
             {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
-            {
-                if (!API.Erase(TapeWinAPI.TAPE_DRIVE_ERASE_IMMEDIATE,ref retCode))
+                if (!API.Erase(TapeWinAPI.TAPE_DRIVE_ERASE_IMMEDIATE, ref retCode))
                 {
                     LogError("ERASE", "Error erasing tape " + retCode);
                 }
@@ -2370,24 +2730,23 @@ namespace mtape
         /// Seek to either a logical or absolute position on the tape
         /// </summary>
         /// <param name="bool Absolute">If true, use absolute positioning</param>
-        private static bool SEEK(bool Absolute,long Location = -1)
+        private static bool SEEK(bool Absolute, long Location = -1)
         {
             bool retValue = false;
             bool tapeOpen = false;
             long whereTo = m_Count;
 
-            if(Location != -1)
+            if (Location != -1)
             {
                 whereTo = Location;
             }
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
-            }
-            else
-            {
-                tapeOpen = true;
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
             String label = "Logical";
             String func = "SEEKL";
@@ -2396,7 +2755,7 @@ namespace mtape
                 label = "Absolute";
                 func = "SEEKA";
             }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 uint retCode = 0;
                 if (Absolute)
@@ -2439,7 +2798,7 @@ namespace mtape
         /// </summary>
         private static bool SEEKA(long Location = -1)
         {
-            return SEEK(true,Location);
+            return SEEK(true, Location);
         }
 
 
@@ -2448,25 +2807,23 @@ namespace mtape
         /// </summary>
         private static bool SEEKL(long Location = -1)
         {
-            return SEEK(false,Location);
+            return SEEK(false, Location);
         }
 
         private static long getCurrentPosition()
         {
-            long retValue = 0;
-            bool tapeOpen = false;
-
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            long retValue = -1;
+            //            bool tapeOpen = false;
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
-            }
-            else
-            {
-                tapeOpen = true;
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
 
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 long position = 0;
                 uint retCode = 0;
@@ -2475,10 +2832,614 @@ namespace mtape
                     m_CurrentPosition = position;
                     retValue = m_CurrentPosition;
                 }
-                API.Close();
             }
             return retValue;
         }
+
+
+
+        private static int scriptProcessor(String funcName, List<String> scriptLines, List<string> Parameters = null)
+        {
+            int retValue = -1;
+            int retCode = 0;
+            String regExPattern = "[A-Z0-9$\\(\\)\\\"\\,]+| (\\\"([^\\\"])*\\\")|(^[A-Z0-9\\s\\=\\\"]*)";
+            Regex rg = new Regex(regExPattern, RegexOptions.IgnoreCase);
+            Dictionary<String, String> mVariables = new Dictionary<string, string>();
+
+            try
+            {
+                if (mFunctParams.ContainsKey(funcName))
+                {
+                    int parmNum = 0;
+                    try
+                    {
+                        foreach (String parameterName in mFunctParams[funcName])
+                        {
+                            if (Parameters != null)
+                            {
+                                if (!mVariables.ContainsKey("$" + parameterName.Replace("\"", "").ToUpper()))
+                                {
+                                    mVariables.Add("$" + parameterName.Replace("\"", "").ToUpper(), Parameters[parmNum]);
+                                }
+                                else
+                                {
+                                    mVariables["$" + parameterName.Replace("\"", "").ToUpper()] = Parameters[parmNum];
+                                }
+                            }
+                            parmNum++;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogError("scriptProcessor:Parameters:", ex.Message);
+                    }
+
+                }
+                int i = 1;
+
+                String switchText = String.Empty;
+
+                bool inSwitch = false;
+                bool caseTrue = false;
+
+                foreach (String tmpText in scriptLines)
+                {
+                    String newText = tmpText;
+                    if (!tmpText.Trim().StartsWith("#"))
+                    {
+                        // Replace the global variables
+                        try
+                        {
+                            foreach (String varName in m_GlobalVariables.Keys)
+                            {
+                                newText = newText.Replace(varName.ToUpper(), m_GlobalVariables[varName]);
+                            }
+                        }
+                        catch(Exception ex)
+                        {
+                            LogError("ScriptProcessor:Global Variables:",ex.Message);
+                        }
+
+                        // Replace the local variables
+                        try
+                        {
+                            foreach (String varName in mVariables.Keys)
+                            {
+                                newText = newText.Replace(varName.ToUpper(), mVariables[varName]);
+                            }
+                        }
+                        catch(Exception ex)
+                        {
+                            LogError("ScriptProcessor:Local Variables:",ex.Message);
+                        }
+                        if (inSwitch)
+                        {
+                            if (newText.ToLower() == "end select")
+                            {
+                                inSwitch = false;
+                            }
+                            else
+                            {
+                                if (newText.ToLower().StartsWith("case"))
+                                {
+                                    string condition = newText.Substring(newText.IndexOf(" ") + 1).Replace(":", "").Trim();
+                                    if (condition.ToLower().Trim() == switchText.ToLower().Trim())
+                                    {
+                                        caseTrue = true;
+                                    }
+                                }
+                                else
+                                {
+                                    if (caseTrue)
+                                    {
+                                        caseTrue = false;
+                                        string tmpFunc = newText.Substring(0, newText.IndexOf("("));
+                                        if (mFunctions.ContainsKey(tmpFunc))
+                                        {
+                                            retCode = retCode + scriptProcessor(tmpFunc, mFunctions[tmpFunc]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if (newText.ToLower().StartsWith("select("))
+                            {
+                                switchText = newText.Substring(newText.IndexOf("(") + 1).Trim().Replace(")", "").Replace("(", "");
+                                inSwitch = true;
+                            }
+                            else
+                            {
+                                if (!newText.Trim().StartsWith("#") && newText.Trim() != string.Empty)
+                                {
+                                    if (!newText.Contains("="))
+                                    {
+                                        MatchCollection matches = rg.Matches(newText);
+                                        if (matches.Count > 0)
+                                        {
+                                            String workString = matches[0].Value;
+
+                                            if (!workString.Contains("="))
+                                            {
+
+                                                if (workString.Contains("(") && mFunctions.ContainsKey(workString.Substring(0, workString.IndexOf("("))))
+                                                {
+                                                    List<String> mParameters = new List<String>();
+                                                    if (!newText.Contains("()"))
+                                                    {
+                                                        int pStart = newText.IndexOf("(") + 1;
+                                                        int pEnd = newText.IndexOf(")");
+                                                        String parmString = newText.Substring(pStart, pEnd - pStart);
+                                                        parmString = parmString.Replace("\"", "");
+                                                        string[] tParmString = parmString.Split(',');
+                                                        mParameters = tParmString.ToList<String>();
+                                                    }
+                                                    retCode = retCode + scriptProcessor(workString.Substring(0, workString.IndexOf("(")), mFunctions[workString.Substring(0, workString.IndexOf("("))], mParameters);
+                                                }
+                                                else
+                                                {
+                                                    switch (matches[0].Value.ToLower())
+                                                    {
+                                                        case "eject()":
+                                                            try
+                                                            {
+                                                                // Commented out for testing purposes
+                                                                EJECT();
+                                                            }
+                                                            catch(Exception ex)
+                                                            {
+                                                                LogError("ScriptProcessor:Eject:",ex.Message);
+                                                            }
+                                                            break;
+                                                        case "keypress()":
+                                                            System.Console.ReadKey();
+                                                            break;
+                                                        case "detectnewtape()":
+                                                            try
+                                                            {
+                                                                System.Console.WriteLine("[" + funcName + "] Detecting new tape in drive.");
+                                                                if (!DetectNewTape())
+                                                                {
+                                                                    return 1;
+                                                                }
+                                                            }
+                                                            catch (Exception ex)
+                                                            {
+                                                                LogError("ScriptProcessor:Eject:", ex.Message);
+                                                            }
+
+                                                            // tape detection 
+                                                            break;
+                                                        case "sendmail()":
+                                                            try
+                                                            {
+                                                                System.Console.WriteLine("[" + funcName + "] Sending email");
+                                                                if (!mVariables.ContainsKey("Reason"))
+                                                                {
+                                                                    mVariables.Add("Reason", m_GlobalVariables["$REASON"]);
+                                                                }
+                                                                else
+                                                                {
+                                                                    mVariables["Reason"] = m_GlobalVariables["$REASON"];
+                                                                }
+                                                                if (!SendMail(mVariables))
+                                                                {
+                                                                    return 1;
+                                                                }
+                                                            }
+                                                            catch (Exception ex)
+                                                            {
+                                                                LogError("ScriptProcessor:SendMail:", ex.Message);
+                                                            }
+
+                                                            // send mail
+                                                            break;
+                                                        case "print":
+                                                            try
+                                                            {
+                                                                if (m_GlobalVariables["$REASON"] == "New Tape")
+                                                                {
+                                                                    System.Console.WriteLine("[" + funcName + "] " + matches[1].Value);
+                                                                }
+                                                                else
+                                                                {
+                                                                    System.Console.WriteLine("[" + funcName + "] " + matches[1].Value);
+                                                                }
+                                                            }
+                                                            catch (Exception ex)
+                                                            {
+                                                                LogError("ScriptProcessor:Print:", ex.Message);
+                                                            }
+
+                                                            break;
+                                                        case "call":
+                                                            // Calls external application or script
+                                                            try
+                                                            {
+                                                                if (!RunExternal(out retCode, " + funcName + "))
+                                                                {
+                                                                    System.Console.WriteLine("[" + funcName + "] External command reported an error :" + retCode);
+                                                                    return 1;
+                                                                }
+                                                            }
+                                                            catch (Exception ex)
+                                                            {
+                                                                LogError("ScriptProcessor:Call:", ex.Message);
+                                                            }
+
+                                                            break;
+                                                        default:
+                                                            try
+                                                            {
+                                                                if (tmpText.Contains("="))
+                                                                {
+                                                                    // Variables defined in the main (i.e. main script) are globally available.
+                                                                    if (funcName == "main")
+                                                                    {
+                                                                        if (!m_GlobalVariables.ContainsKey(matches[0].Value))
+                                                                        {
+                                                                            m_GlobalVariables.Add(matches[0].Value, matches[1].Value);
+                                                                        }
+                                                                        else
+                                                                        {
+                                                                            m_GlobalVariables[matches[0].Value] = matches[1].Value;
+                                                                        }
+                                                                    }
+                                                                    else
+                                                                    {
+                                                                        if (!mVariables.ContainsKey(matches[0].Value))
+                                                                        {
+                                                                            mVariables.Add(matches[0].Value, matches[1].Value);
+                                                                        }
+                                                                        else
+                                                                        {
+                                                                            mVariables[matches[0].Value] = matches[1].Value;
+                                                                        }
+                                                                    }
+                                                                }
+                                                                else
+                                                                {
+                                                                    System.Console.WriteLine("[" + funcName + "] Unrecognized command line " + tmpText);
+                                                                }
+                                                            }
+                                                            catch (Exception ex)
+                                                            {
+                                                                LogError("ScriptProcessor:Default:", ex.Message);
+                                                            }
+
+                                                            break;
+                                                    }
+                                                }
+                                            }
+                                            else
+                                            {
+                                                if (funcName == "main")
+                                                {
+                                                    try
+                                                    {
+                                                        if (!m_GlobalVariables.ContainsKey(matches[0].Value))
+                                                        {
+                                                            m_GlobalVariables.Add(matches[0].Value, matches[1].Value);
+                                                        }
+                                                        else
+                                                        {
+                                                            m_GlobalVariables[matches[0].Value] = matches[1].Value;
+                                                        }
+                                                    }
+                                                    catch(Exception ex)
+                                                    {
+                                                        LogError("ScriptProcessor:Set Global:", ex.Message);
+                                                    }
+
+                                                }
+                                                else
+                                                {
+                                                    try
+                                                    {
+                                                        if (!mVariables.ContainsKey(matches[0].Value))
+                                                        {
+                                                            mVariables.Add(matches[0].Value, matches[1].Value);
+                                                        }
+                                                        else
+                                                        {
+                                                            mVariables[matches[0].Value] = matches[1].Value;
+                                                        }
+                                                    }
+                                                    catch (Exception ex)
+                                                    {
+                                                        LogError("ScriptProcessor:Set Local:", ex.Message);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        else
+                                        {
+                                            System.Console.WriteLine("[" + funcName + "] Unmatched command line '" + newText + "'");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        string[] splitted = newText.Split('=');
+                                        if (funcName == "main")
+                                        {
+                                            try
+                                            {
+                                                if (!m_GlobalVariables.ContainsKey(splitted[0]))
+                                                {
+                                                    m_GlobalVariables.Add(splitted[0], splitted[1].Replace("\"", ""));
+                                                }
+                                                else
+                                                {
+                                                    m_GlobalVariables[splitted[0]] = splitted[1].Replace("\"", "");
+                                                }
+                                            }
+                                            catch(Exception ex)
+                                            {
+                                                LogError("scriptProcessor", "Error setting global variable :" + splitted[0] + " Error:" + ex.Message);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            try
+                                            {
+                                                if (!mVariables.ContainsKey(splitted[0]))
+                                                {
+                                                    mVariables.Add(splitted[0], splitted[1].Replace("\"", ""));
+                                                }
+                                                else
+                                                {
+                                                    mVariables[splitted[0]] = splitted[1].Replace("\"", "");
+                                                }
+                                            }
+                                            catch(Exception ex)
+                                            {
+                                                LogError("scriptProcessor", "Error setting local variable :" + splitted[0] + " Error:" + ex.Message);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch(Exception ex)
+            {
+                LogError("ScriptProcessor", "An unexpected error occurred during the processing of the mTape2 script.  Error:" + ex.Message);
+                retValue = -1;
+            }
+
+            return retValue;
+        }
+
+
+
+        /// <summary>
+        /// Interpret an mTape script
+        /// </summary>
+        /// <returns>bool Success</returns>
+        public static bool runMTapeScript(int ReasonCode, String Script, out int returnCode, String Message = "")
+        {
+            bool retValue = false;
+            int retCode = 0;
+            string[] text = System.IO.File.ReadAllLines(Script);
+            try
+            {
+                m_Message = Message;
+                String funPattern = "[A-Z0-9$\\(\\)\\\"\\,]+| (\\\"([^\\\"])*\\\")";
+
+                List<String> functionLines = new List<string>();
+                bool ReadFunction = false;
+                String functionName = string.Empty;
+
+                String Reason = string.Empty;
+                switch (ReasonCode)
+                {
+                    case NewTape:
+                        Reason = "New Tape";
+                        break;
+                    case StartBackup:
+                        Reason = "Archive Started";
+                        break;
+                    case EndBackup:
+                        Reason = "Archive Ended";
+                        break;
+                    case Alert:
+                        Reason = "Alert";
+                        break;
+                    case TapeNeeded:
+                        Reason = "Tape Needed";
+                        break;
+                    case Clean:
+                        Reason = "Clean";
+                        break;
+                }
+
+                if (!m_GlobalVariables.ContainsKey("$VOLUME"))
+                {
+                    m_GlobalVariables.Add("$VOLUME", "VOL_" + zeroFill(m_VolumeNumber, 4));
+                }
+                else
+                {
+                    m_GlobalVariables["$VOLUME"] = "VOL_" + zeroFill(m_VolumeNumber, 4);
+                }
+                if (!m_GlobalVariables.ContainsKey("$REASON"))
+                {
+                    m_GlobalVariables.Add("$REASON", Reason);
+                }
+                else
+                {
+                    m_GlobalVariables["$REASON"] = Reason;
+                }
+                if (!m_GlobalVariables.ContainsKey("$DATETIME"))
+                {
+                    m_GlobalVariables.Add("$DATETIME", DateTime.Now.ToShortDateString() + " " + DateTime.Now.ToShortTimeString());
+                }
+                else
+                {
+                    m_GlobalVariables["$DATETIME"] = DateTime.Now.ToShortDateString() + " " + DateTime.Now.ToShortTimeString();
+                }
+                if (!m_GlobalVariables.ContainsKey("$1"))
+                {
+                    m_GlobalVariables.Add("$1", Reason);
+                }
+                else
+                {
+                    m_GlobalVariables["$1"] = Reason;
+                }
+                if (!m_GlobalVariables.ContainsKey("$2"))
+                {
+                    m_GlobalVariables.Add("$2", "VOL_" + zeroFill((m_VolumeNumber + 1), 4));
+                }
+                else
+                {
+                    m_GlobalVariables["$2"] = "VOL_" + zeroFill(m_VolumeNumber + 1, 4);
+                }
+                if (!m_GlobalVariables.ContainsKey("$0"))
+                {
+                    m_GlobalVariables.Add("$0", "VOL_" + zeroFill((m_VolumeNumber + 1), 4));
+                }
+                else
+                {
+                    m_GlobalVariables["$0"] = "VOL_" + zeroFill(m_VolumeNumber + 1, 4);
+                }
+                if (!m_GlobalVariables.ContainsKey("$3"))
+                {
+                    m_GlobalVariables.Add("$3", m_Message);
+                }
+                else
+                {
+                    m_GlobalVariables["$3"] = m_Message;
+                }
+
+
+                foreach (String tmpText in text)
+                {
+                    String workText = tmpText.Trim();
+                    if (!ReadFunction)
+                    {
+
+                        if (!workText.StartsWith("#") && workText != string.Empty)
+                        {
+                            Regex rgf = new Regex(funPattern, RegexOptions.IgnoreCase);
+                            MatchCollection matches = rgf.Matches(workText);
+                            if (matches.Count > 0)
+                            {
+                                if (workText.EndsWith("{"))
+                                {
+                                    functionName = matches[0].Value;
+                                    functionName = functionName.Substring(0, functionName.IndexOf("("));
+                                    ReadFunction = true;
+                                }
+                                else
+                                {
+                                    functionName = "main";
+                                    ReadFunction = true;
+                                    functionLines.Add(workText);
+                                }
+
+                                if (tmpText.Contains("(") && !tmpText.Contains("()"))
+                                {
+                                    int pStart = tmpText.IndexOf("(") + 1;
+                                    int pEnd = tmpText.IndexOf(")");
+                                    String tParms = tmpText.Substring(pStart, pEnd - pStart);
+                                    string[] tParmItems = tParms.Split(',');
+                                    List<String> tParmNames = new List<string>();
+                                    foreach (String tmp in tParmItems)
+                                    {
+                                        tParmNames.Add(tmp);
+                                    }
+                                    if (!mFunctParams.ContainsKey(functionName))
+                                    {
+                                        mFunctParams.Add(functionName, tParmNames);
+                                    }
+                                    else
+                                    {
+                                        mFunctParams[functionName] = tParmNames;
+                                    }
+                                }
+
+                            }
+                            else
+                            {
+                                if (!mFunctions.ContainsKey("main"))
+                                {
+                                    functionName = "main";
+                                    ReadFunction = true;
+                                    functionLines.Add(workText);
+
+                                }
+                                else
+                                {
+                                    mFunctions["main"].Add(workText);
+
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (workText.StartsWith("}"))
+                        {
+                            ReadFunction = false;
+                            if (!mFunctions.ContainsKey(functionName))
+                            {
+                                mFunctions.Add(functionName, functionLines);
+                            }
+                            else
+                            {
+                                mFunctions[functionName] = functionLines;
+                            }
+                            functionLines = new List<string>();
+                        }
+                        else
+                        {
+                            functionLines.Add(workText);
+                            retCode = 0;
+                        }
+
+                    }
+                }
+                if (ReadFunction)
+                {
+                    if (!mFunctions.ContainsKey("main"))
+                    {
+                        mFunctions.Add("main", functionLines);
+                    }
+                    else
+                    {
+                        mFunctions["main"] = functionLines;
+                    }
+                    if (mFunctions.ContainsKey("main"))
+                    {
+                        retCode = scriptProcessor("main", mFunctions["main"]);
+                    }
+                    else
+                    {
+                        retCode = 0;
+                    }
+                }
+            }
+            catch(Exception ex)
+            {
+                LogError("runMTapeScript", "An unexpected error occurred during script execution. Error:" + ex.Message);
+                var w32ex = ex as Win32Exception;
+                if (w32ex == null)
+                {
+                    w32ex = ex.InnerException as Win32Exception;
+                }
+                if (w32ex != null)
+                {
+                    returnCode = w32ex.ErrorCode;
+                    // do stuff
+                }
+                retValue = false;
+            }
+            returnCode = retCode;
+            return retValue;
+        }
+
 
         /// <summary>
         /// Prints the current position on the tape
@@ -2486,25 +3447,34 @@ namespace mtape
         private static void TELL()
         {
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
-            }
-            else
-            {
-                tapeOpen = true;
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
 
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 long position = 0;
                 uint retCode = 0;
-                if(API.GetTapePosition(ref position, ref retCode))
+                if (API.GetTapePosition(ref position, ref retCode))
                 {
                     LogMessage("TELL", "Position: " + position);
                 }
-                API.Close();
+                else
+                {
+                    if(retCode == 1112)
+                    {
+                        LogMessage("TELL", "There isn't a tape in the drive.");
+                    }
+                }
+            }
+            else
+            {
+                System.Console.WriteLine("TELL Error: Tape is not open");
             }
         }
 
@@ -2539,16 +3509,15 @@ namespace mtape
         {
             uint retCode = 0;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 if (!API.Load(ref retCode))
                 {
@@ -2573,21 +3542,20 @@ namespace mtape
         {
             uint retCode = 0;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 TapeWinAPI.TapeSetMediaParameters TParms = new TapeWinAPI.TapeSetMediaParameters();
-                
-                TParms.BlockSize = (uint) m_Count;
-                if(!API.SetMediaParameters(TParms,ref retCode))
+
+                TParms.BlockSize = (uint)m_Count;
+                if (!API.SetMediaParameters(TParms, ref retCode))
                 {
                     LogError("SETBLK", "Error setting the block size " + retCode);
                 }
@@ -2626,16 +3594,15 @@ namespace mtape
         {
             uint retCode = 0;
             bool tapeOpen = false;
-            if (!API.Open(@"\\.\" + API.TapeDrive))
+            if (!API.IsTapeOpen())
             {
-                System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
-                LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                if (!API.Open(@"\\.\" + API.TapeDrive))
+                {
+                    System.Console.WriteLine("Tape drive:" + @"\\.\" + API.TapeDrive);
+                    LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
+                }
             }
-            else
-            {
-                tapeOpen = true;
-            }
-            if (tapeOpen)
+            if (API.IsTapeOpen())
             {
                 TapeWinAPI.TapeSetDriveParameters TParms = new TapeWinAPI.TapeSetDriveParameters();
 
@@ -2753,7 +3720,7 @@ namespace mtape
         {
             Dummy("Stsetcln");
         }
-        
+
         /// <summary>
         /// Initiate tape connection and set tape drive to the appropriate name.
         /// </summary>
@@ -2803,7 +3770,7 @@ namespace mtape
         /// <returns>the value of the smaller</returns>
         private static int min(int i, int j)
         {
-            if(i < j)
+            if (i < j)
             {
                 return i;
             }
@@ -2833,9 +3800,9 @@ namespace mtape
             bool newLine = true;
             bool firstRun = true;
 
-            foreach(String tmpWrd in wrdSplit)
+            foreach (String tmpWrd in wrdSplit)
             {
-                if(!ignoreFirst)
+                if (!ignoreFirst)
                 {
                     if (newLine)
                     {
@@ -2848,7 +3815,7 @@ namespace mtape
                     }
                     ignoreFirst = false;
                 }
-                if(outString.Length + 1 + tmpWrd.Length <= screenWidth)
+                if (outString.Length + 1 + tmpWrd.Length <= screenWidth)
                 {
                     if (!firstRun)
                     {
@@ -2873,11 +3840,11 @@ namespace mtape
                     System.Console.WriteLine(outString);
                     outString = string.Empty;
                     newLine = true;
-                    outString = padLeft(" ", tabPosition-1) + tmpWrd;
+                    outString = padLeft(" ", tabPosition - 1) + tmpWrd;
                     ignoreFirst = true;
                 }
             }
-            if(outString != string.Empty)
+            if (outString != string.Empty)
             {
                 System.Console.WriteLine(outString);
             }
@@ -2890,7 +3857,7 @@ namespace mtape
         /// <param name="string titleText (i.e. first column)"></param>
         /// <param name="string cmdText (i.e. second column)"></param>
         /// <param name="string detailText (i.e. third column)"></param>
-        private static void ScreenWriter(String titleText, String cmdText = "" ,String detailText = "")
+        private static void ScreenWriter(String titleText, String cmdText = "", String detailText = "")
         {
             bool ignoreTab = false;
             bool newLine = false;
@@ -2948,14 +3915,14 @@ namespace mtape
         {
             ScreenWriter("mt v. 1.0");
             ScreenWriter("usage: mtape [-v] [--version] [-h] [--help] [-f device] command [count | sourcefile | sourcefile targetfile]");
-            ScreenWriter("commands:","weof, wset, eof, fsf, fsfm, bsf, bsfm, fsr, bsr, fss, bss, rewind,");
-            ScreenWriter("","offline, rewoffl, eject, retention, eod, seod, seeka, seekl, tell, status,");
-            ScreenWriter("","erase, setblk, lock, unlock, load, compression, setdensity,");
-            ScreenWriter("","drvbuffer, stwrthreshold, stoptions, stsetoptions, stclearoptions,");
-            ScreenWriter("","defblksize, defdensity, defdrvbuffer, defcompression, stsetcln,");
-            ScreenWriter("","sttimeout, stlongtimeout, densities, setpartition, mkpartition");
+            ScreenWriter("commands:", "weof, wset, eof, fsf, fsfm, bsf, bsfm, fsr, bsr, fss, bss, rewind,");
+            ScreenWriter("", "offline, rewoffl, eject, retention, eod, seod, seeka, seekl, tell, status,");
+            ScreenWriter("", "erase, setblk, lock, unlock, load, compression, setdensity,");
+            ScreenWriter("", "drvbuffer, stwrthreshold, stoptions, stsetoptions, stclearoptions,");
+            ScreenWriter("", "defblksize, defdensity, defdrvbuffer, defcompression, stsetcln,");
+            ScreenWriter("", "sttimeout, stlongtimeout, densities, setpartition, mkpartition");
             ScreenWriter("", "partseek, asf, stshowoptions, locate, read, write, continue");
-            ScreenWriter("","resume, writelist, info, init.");
+            ScreenWriter("", "resume, writelist, info, init.");
         }
 
         private static void testMessage()
@@ -2981,139 +3948,139 @@ namespace mtape
             ScreenWriter("");
             ScreenWriter("", "The available operations are listed below.  Unique abbreviates are accepted.  Not all operations are avilable on all systems, or work on all types of tape drives.");
             ScreenWriter("");
-            ScreenWriter("","fsf","Forward space count files.  The tape is positioned on the first block of the next file.");
+            ScreenWriter("", "fsf", "Forward space count files.  The tape is positioned on the first block of the next file.");
             ScreenWriter("");
-            ScreenWriter("","fsfm", "Forward space count files, then backward space one record.  This leaves the tape positioned at the last block of the file that is count - 1 files past the current file.");
+            ScreenWriter("", "fsfm", "Forward space count files, then backward space one record.  This leaves the tape positioned at the last block of the file that is count - 1 files past the current file.");
             ScreenWriter("");
             ScreenWriter("", "bsf", "Backward space count files.  The tape is positioned on the last block of the previous file.");
             ScreenWriter("");
             ScreenWriter("", "bsfm", "Backward space count files, then forward space one record.  This leaves the tape positioned at the first block of the file that is count - 1 files before the current file.");
 
             ScreenWriter("");
-            ScreenWriter("","asf","The tape is positioned at the beginning of the count file.  Positioning is done by first rewinding the tape and then spacing forward over count filemarks.");
+            ScreenWriter("", "asf", "The tape is positioned at the beginning of the count file.  Positioning is done by first rewinding the tape and then spacing forward over count filemarks.");
             ScreenWriter("");
-            ScreenWriter("","fsr","Forward space count records.");
+            ScreenWriter("", "fsr", "Forward space count records.");
             ScreenWriter("");
-            ScreenWriter("","bsr","Backward space count records.");
+            ScreenWriter("", "bsr", "Backward space count records.");
             ScreenWriter("");
-            ScreenWriter("","fss","(SCSI tapes) Forward space count setmarks.");
+            ScreenWriter("", "fss", "(SCSI tapes) Forward space count setmarks.");
             ScreenWriter("");
-            ScreenWriter("","bss","(SCSI tapes) Backward space count setmarks.");
+            ScreenWriter("", "bss", "(SCSI tapes) Backward space count setmarks.");
             ScreenWriter("");
-            ScreenWriter("","eod, seod", "Space to end of valid data.  Used on streamer tape drives to append data to the logical end of tape.");
+            ScreenWriter("", "eod, seod", "Space to end of valid data.  Used on streamer tape drives to append data to the logical end of tape.");
 
             ScreenWriter("");
-            ScreenWriter("", "rewind","Rewind the tape.");
+            ScreenWriter("", "rewind", "Rewind the tape.");
             ScreenWriter("");
             ScreenWriter("", "offline, rewoffl, eject", "Rewind the tape and, if appicable, unload the tape.");
             ScreenWriter("");
             ScreenWriter("", "retention", "Rewind the tape, then wind it to the end of the reel, then rewind it again.");
-            ScreenWriter(""); 
+            ScreenWriter("");
             ScreenWriter("", "weof, eof", "Write count EOF marks at current position.");
             ScreenWriter("");
             ScreenWriter("", "wset", "(SCSI tapes) Write count setmarks at current position (only SCSI tape).");
             ScreenWriter("");
-            ScreenWriter("","erase","Erase the tape.  Note that this is a long erase, which on modern (high-capacity) tapes can take many hours, and which usually can't be aborted");
+            ScreenWriter("", "erase", "Erase the tape.  Note that this is a long erase, which on modern (high-capacity) tapes can take many hours, and which usually can't be aborted");
             ScreenWriter("");
-            ScreenWriter("","status","Print status information about the tape unit.  (f the density code is \"no translation\" in the status output, this does not affect working of the tape drive.");
-            
+            ScreenWriter("", "status", "Print status information about the tape unit.  (f the density code is \"no translation\" in the status output, this does not affect working of the tape drive.");
+
             ScreenWriter("");
-            ScreenWriter("","seeka", "(SCSI tapes) Seek to the count absolute location on the tape.  This operation is available on some Tandberg and Wangtek streamers and some SCSI-2 tape drives.  The block address should be obtained from a tell call earlier.");
+            ScreenWriter("", "seeka", "(SCSI tapes) Seek to the count absolute location on the tape.  This operation is available on some Tandberg and Wangtek streamers and some SCSI-2 tape drives.  The block address should be obtained from a tell call earlier.");
             ScreenWriter("");
             ScreenWriter("", "seekl", "(SCSI tapes) Seek to the count logical location on the tape.  This operation is available on some Tandberg and Wangtek streamers and some SCSI-2 tape drives.  The block address should be obtained from a tell call earlier.");
 
             ScreenWriter("");
-            ScreenWriter("","tell","(SCSI tapes) Tell the current block on tape.  This operation is available on some Tandberg and Wangtek streamers and some SCSI-2 tape drives.");
+            ScreenWriter("", "tell", "(SCSI tapes) Tell the current block on tape.  This operation is available on some Tandberg and Wangtek streamers and some SCSI-2 tape drives.");
             ScreenWriter("");
-            ScreenWriter("","setpartition", "(SCSI tapes) Switch to the partition determined by count.  The default data partition of the tape is numbered zero.  Switching partition is available only if enabled for the device, the device supports multiple partitions, and the tape is formatted with multiple partitions.");
-            
-            ScreenWriter("");
-            ScreenWriter("","partseek", "(SCSI tapes) The tape position is set to block count in the parition given by the argument after count.  The default parition is zero.");
+            ScreenWriter("", "setpartition", "(SCSI tapes) Switch to the partition determined by count.  The default data partition of the tape is numbered zero.  Switching partition is available only if enabled for the device, the device supports multiple partitions, and the tape is formatted with multiple partitions.");
 
             ScreenWriter("");
-            ScreenWriter("","mkpartition", "(SCSI tapes) Format the tape with one (count is zero) or two partitions (count gives the size of the second partition in megabytes). If the count is positive, it specifies the size of partition 1.  From kernel version 4.6, if the count is negative, it specifies the size of partition 0.  With older kernels, a negative argument formats the tape with one partition.  The tape drive must be able to format partitioned tapes with initiator-specified partition size and partition support must be enabled for the drive.");
+            ScreenWriter("", "partseek", "(SCSI tapes) The tape position is set to block count in the parition given by the argument after count.  The default parition is zero.");
+
             ScreenWriter("");
-            ScreenWriter("","load", "(SCSI tapes) Send the load command to the tape drive.  The drives usually load the tape when a new cartridge is inserted.  The argument count can usually be omitted.  Some HP changers load tape n if the count 10000 + n is given (a special function in the Linux st driver).");
-            
+            ScreenWriter("", "mkpartition", "(SCSI tapes) Format the tape with one (count is zero) or two partitions (count gives the size of the second partition in megabytes). If the count is positive, it specifies the size of partition 1.  From kernel version 4.6, if the count is negative, it specifies the size of partition 0.  With older kernels, a negative argument formats the tape with one partition.  The tape drive must be able to format partitioned tapes with initiator-specified partition size and partition support must be enabled for the drive.");
             ScreenWriter("");
-            ScreenWriter("","lock","(SCSI tapes) Lock the tape drive door.");
+            ScreenWriter("", "load", "(SCSI tapes) Send the load command to the tape drive.  The drives usually load the tape when a new cartridge is inserted.  The argument count can usually be omitted.  Some HP changers load tape n if the count 10000 + n is given (a special function in the Linux st driver).");
+
             ScreenWriter("");
-            ScreenWriter("","unlock","(SCSI tapes) Unlock the tape drive door.");
+            ScreenWriter("", "lock", "(SCSI tapes) Lock the tape drive door.");
             ScreenWriter("");
-            ScreenWriter("","setblk","(SCSI tapes) Set the block size of the drive to count bytes per record");
+            ScreenWriter("", "unlock", "(SCSI tapes) Unlock the tape drive door.");
             ScreenWriter("");
-            ScreenWriter("","setdensity", "(SCSI tapes) Set the tape density code to count.  The proper codes to use with each drive should be looked up from the drive documentation.");
+            ScreenWriter("", "setblk", "(SCSI tapes) Set the block size of the drive to count bytes per record");
             ScreenWriter("");
-            ScreenWriter("","densities", "(SCSI tapes) Write explanation of some common desnity codes to standard output.");
-            
+            ScreenWriter("", "setdensity", "(SCSI tapes) Set the tape density code to count.  The proper codes to use with each drive should be looked up from the drive documentation.");
+            ScreenWriter("");
+            ScreenWriter("", "densities", "(SCSI tapes) Write explanation of some common desnity codes to standard output.");
+
             ScreenWriter("");
             ScreenWriter("", "drvbuffer", "(SCSI tapes) Set the tape drive buffer code to number.  The proper value for unbuffered operation is zero and \"normal\" buffered operation one.  The meanings of other values can be found in the drive documentation or, in the case of a SCSI-2 drive, from the SCSI-2 standard.");
 
             ScreenWriter("", "compression", "(SCSI tapes) The compression within the drive can be switched on or off using the MTCOMPRESSION ioctl.  Note that this method is not supported by all drives implementing compression.  For instance, the Exabyte 8 mm drivers use density codes to select compression.");
             ScreenWriter("");
-            ScreenWriter("","stoptions", "(SCSI tapes) Set the driver options bits for the device to the defined values.  Allowed only for the superuser.  The bits can be set either by ORing the option bits from the file /usr/include/linux/mtio.h to count, or by using the following keywords (as many keywords can be used on the same line as necessary, unambiguous abbreviations allowed):");
+            ScreenWriter("", "stoptions", "(SCSI tapes) Set the driver options bits for the device to the defined values.  Allowed only for the superuser.  The bits can be set either by ORing the option bits from the file /usr/include/linux/mtio.h to count, or by using the following keywords (as many keywords can be used on the same line as necessary, unambiguous abbreviations allowed):");
             ScreenWriter("");
-            ScreenWriter(""," ","     buffer-writes   buffered writes enabled");
+            ScreenWriter("", " ", "     buffer-writes   buffered writes enabled");
             ScreenWriter("");
-            ScreenWriter(""," ","     async-writes    asynchronous writes enabled");
+            ScreenWriter("", " ", "     async-writes    asynchronous writes enabled");
             ScreenWriter("");
-            ScreenWriter(""," ","     read-ahead      read-ahead for fixed block size");
+            ScreenWriter("", " ", "     read-ahead      read-ahead for fixed block size");
             ScreenWriter("");
-            ScreenWriter(""," ","     debug           debugging (if compiled into driver)");
+            ScreenWriter("", " ", "     debug           debugging (if compiled into driver)");
             ScreenWriter("");
-            ScreenWriter(""," ","     two-fms         write two filemarks when file closed");
+            ScreenWriter("", " ", "     two-fms         write two filemarks when file closed");
             ScreenWriter("");
-            ScreenWriter(""," ","     fast-eod        space directly to eod (and lose file number)");
+            ScreenWriter("", " ", "     fast-eod        space directly to eod (and lose file number)");
             ScreenWriter("");
-            ScreenWriter(""," ","     no-wait         don't wait until rewind, etc. complete");
+            ScreenWriter("", " ", "     no-wait         don't wait until rewind, etc. complete");
             ScreenWriter("");
-            ScreenWriter(""," ","     auto-lock       automatically lock/unlock drive door");
+            ScreenWriter("", " ", "     auto-lock       automatically lock/unlock drive door");
             ScreenWriter("");
-            ScreenWriter(""," ","     def-writes      the block size and desntity are for writes");
+            ScreenWriter("", " ", "     def-writes      the block size and desntity are for writes");
             ScreenWriter("");
-            ScreenWriter(""," ","     can-bsr         drive can space backwards as well");
+            ScreenWriter("", " ", "     can-bsr         drive can space backwards as well");
             ScreenWriter("");
-            ScreenWriter(""," ","     no-blklimits    drive doesn't support read block limits");
+            ScreenWriter("", " ", "     no-blklimits    drive doesn't support read block limits");
             ScreenWriter("");
-            ScreenWriter(""," ","     can-partitions  drive can handle partitioned tapes");
+            ScreenWriter("", " ", "     can-partitions  drive can handle partitioned tapes");
             ScreenWriter("");
-            ScreenWriter(""," ","     scsi2logical    seek and tell use SCSI-2 logical block addresses instead of device dependent addresses");
+            ScreenWriter("", " ", "     scsi2logical    seek and tell use SCSI-2 logical block addresses instead of device dependent addresses");
             ScreenWriter("");
-            ScreenWriter(""," ","     sili            Set the SILI bit is when reading in variable block mode.  This may speed up reading blocks shorter than the read byte count.  Set this option only if you know that the drive supports SILI and the HBA reliably returns transfer residual byte counts.  Requires kernel version >= 2.6.26.");
+            ScreenWriter("", " ", "     sili            Set the SILI bit is when reading in variable block mode.  This may speed up reading blocks shorter than the read byte count.  Set this option only if you know that the drive supports SILI and the HBA reliably returns transfer residual byte counts.  Requires kernel version >= 2.6.26.");
             ScreenWriter("");
-            ScreenWriter(""," ","     sysv            Enable the System V semantics");
+            ScreenWriter("", " ", "     sysv            Enable the System V semantics");
             ScreenWriter("");
-            ScreenWriter("","stsetoptions", "(SCSI tapes) Set selected driver options bits.  The methods to specify the bits to set are given above in the description of stoptions.  Allowed only for the superuser.");
+            ScreenWriter("", "stsetoptions", "(SCSI tapes) Set selected driver options bits.  The methods to specify the bits to set are given above in the description of stoptions.  Allowed only for the superuser.");
             ScreenWriter("");
-            ScreenWriter("","stclearoptions", "(SCSI tapes) Clear selected driver option bits.  The methods to specify the bits to clear are given above in deescription of stoptions.  Allowed only for the superuser.");
+            ScreenWriter("", "stclearoptions", "(SCSI tapes) Clear selected driver option bits.  The methods to specify the bits to clear are given above in deescription of stoptions.  Allowed only for the superuser.");
             ScreenWriter("");
-            ScreenWriter("","stshowoptions", "(SCSI tapes) Print the currently enabled options for the device.  Requires kernel version >= 2.6.26 and sysfs must be moutned at /sys.");
+            ScreenWriter("", "stshowoptions", "(SCSI tapes) Print the currently enabled options for the device.  Requires kernel version >= 2.6.26 and sysfs must be moutned at /sys.");
             ScreenWriter("");
-            ScreenWriter("","stwrthreshold", "(SCSI tapes) The write threshold for the tape device is set to count kilobytes.  The value must be smaller than or equal to the driver buffer size.  Allowed only for the superuser.");
+            ScreenWriter("", "stwrthreshold", "(SCSI tapes) The write threshold for the tape device is set to count kilobytes.  The value must be smaller than or equal to the driver buffer size.  Allowed only for the superuser.");
             ScreenWriter("");
-            ScreenWriter("","defblksize", "(SCSI tapes) Set the default block size of the device to count ytes.  The value -1 disables the default block size.  The block size set by setblk overrides the default until a new tape is inserted.  Allowed only for the superuser.");
+            ScreenWriter("", "defblksize", "(SCSI tapes) Set the default block size of the device to count ytes.  The value -1 disables the default block size.  The block size set by setblk overrides the default until a new tape is inserted.  Allowed only for the superuser.");
             ScreenWriter("");
-            ScreenWriter("","defdensity", "(SCSI tapes) Set the default density code.  The value -1 disables the default desnity.  The desnity set by setdensity overrides the default until a new tape is inserted.  Allowed only for the superuser.");
+            ScreenWriter("", "defdensity", "(SCSI tapes) Set the default density code.  The value -1 disables the default desnity.  The desnity set by setdensity overrides the default until a new tape is inserted.  Allowed only for the superuser.");
             ScreenWriter("");
             ScreenWriter("", "defdrvbuffer", "(SCSI tapes) Set the default drive buffer code.  The value -1 disables the default drive buffer code.  The drive buffer code set by drvbuffer overrides the default until a new tape is inserted.  Alowed only for the superuser");
             ScreenWriter("");
-            ScreenWriter("","defcompression", "(SCSI tapes) Set the default ompression state.  The value -1 disables the default compression.  The compression state set by compression over rides the default until a new tape is inserted.  Allowed only for the superuser.");
+            ScreenWriter("", "defcompression", "(SCSI tapes) Set the default ompression state.  The value -1 disables the default compression.  The compression state set by compression over rides the default until a new tape is inserted.  Allowed only for the superuser.");
             ScreenWriter("");
-            ScreenWriter("","sttimeout", "sets the normal timeout for the device.  The value is given in seconds.  Allowed only for the superuser.");
+            ScreenWriter("", "sttimeout", "sets the normal timeout for the device.  The value is given in seconds.  Allowed only for the superuser.");
             ScreenWriter("");
-            ScreenWriter("","stlongtimeout", "sets the long timeout for the device.  The value is given in seconds.  Allowedo nly for the superuser.");
+            ScreenWriter("", "stlongtimeout", "sets the long timeout for the device.  The value is given in seconds.  Allowedo nly for the superuser.");
             ScreenWriter("");
-            ScreenWriter("","stsetcln", "set the cleaning request interpretation parameters.");
+            ScreenWriter("", "stsetcln", "set the cleaning request interpretation parameters.");
             ScreenWriter("");
-            ScreenWriter("","read", "reads a file from tape and optionally writes to specified file.  Default writes to stdout.");
+            ScreenWriter("", "read", "reads a file from tape and optionally writes to specified file.  Default writes to stdout.");
             ScreenWriter("");
-            ScreenWriter("","write", "writes specified file to tape.  If a location is specifed, it mtape will advance to that filemark before writing.");
+            ScreenWriter("", "write", "writes specified file to tape.  If a location is specifed, it mtape will advance to that filemark before writing.");
             ScreenWriter("");
             ScreenWriter("", "writelist", "writes files from specified file list to tape. If a location is specifed, it mtape will advance to that filemark before writing.");
             ScreenWriter("");
             ScreenWriter("", "locate", "Locates file in the tape library, requests the appropriate volume, seeks to the appropriate location on tape and restores the the specified target file name.");
             ScreenWriter("");
-            ScreenWriter("","info", "mtape prints a list of tape and device parameters");
+            ScreenWriter("", "info", "mtape prints a list of tape and device parameters");
             ScreenWriter("");
             ScreenWriter(" ", "init", "Initialize tape library.");
             ScreenWriter(" ");
@@ -3121,24 +4088,24 @@ namespace mtape
             ScreenWriter("");
             ScreenWriter("", "resume", "Resumes writing to the current volume by identifying what was scheduled to be written but did not complete and then appending.");
             ScreenWriter("");
-            ScreenWriter("","","mtape exits with a status of 0 if the operation succeeded, 1 if the operation or device name given was invalid, or 2 if the operation failed.");
+            ScreenWriter("", "", "mtape exits with a status of 0 if the operation succeeded, 1 if the operation or device name given was invalid, or 2 if the operation failed.");
             ScreenWriter("");
             ScreenWriter("OPTIONS");
-            ScreenWriter("","-h, --help", "Print a usage message on standard output and exit successfully.");
+            ScreenWriter("", "-h, --help", "Print a usage message on standard output and exit successfully.");
             ScreenWriter("");
             ScreenWriter("", "-v, --version", "Prints the current mtape version number.");
             ScreenWriter("");
-            ScreenWriter("","-f, -t", "The path of the tape device on which to operate.  If neither of those options is given, and the environment variable TAPE is set, it is used.  Otherwise, a default device defined in the file /usr/include/sys/mtio.h is used (note that the actual path to mtio.h can vary per architecture and/or distribution).");
+            ScreenWriter("", "-f, -t", "The path of the tape device on which to operate.  If neither of those options is given, and the environment variable TAPE is set, it is used.  Otherwise, a default device defined in the file /usr/include/sys/mtio.h is used (note that the actual path to mtio.h can vary per architecture and/or distribution).");
             ScreenWriter("");
-            ScreenWriter("NOTES","", "The argument of mkpartition specifies the size of the partition in megabytes.  If you add a postfix, it applies to this definition.  For example, argument 1G means 1 giga megabytes, which probably is not what the user is anticipating.");
+            ScreenWriter("NOTES", "", "The argument of mkpartition specifies the size of the partition in megabytes.  If you add a postfix, it applies to this definition.  For example, argument 1G means 1 giga megabytes, which probably is not what the user is anticipating.");
             ScreenWriter("");
-            ScreenWriter("AUTHOR","", "The program is written by Phillip Jones (based on Kai Makisara's mt), and is currently maintained by Phillip Jones<jones.phillip.a@gmail.com>.");
+            ScreenWriter("AUTHOR", "", "The program is written by Phillip Jones (based on Kai Makisara's mt), and is currently maintained by Phillip Jones<jones.phillip.a@gmail.com>.");
             ScreenWriter("");
-            ScreenWriter("COPYRIGHT","", "The program and the manual page are copyrighted by Phillip Jones, 2020-.  They can be distributed according to the GNU Copyleft.");
+            ScreenWriter("COPYRIGHT", "", "The program and the manual page are copyrighted by Phillip Jones, 2020-.  They can be distributed according to the GNU Copyleft.");
             ScreenWriter("");
-            ScreenWriter("BUGS","", "Please report bugs to <jones.phillip.a@gmail.com>.");
+            ScreenWriter("BUGS", "", "Please report bugs to <jones.phillip.a@gmail.com>.");
             ScreenWriter("");
-            ScreenWriter("SEE ALSO","","");
+            ScreenWriter("SEE ALSO", "", "");
             ScreenWriter("");
             // Print a usage message on standard output and exit successfully.
 

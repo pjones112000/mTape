@@ -19,6 +19,8 @@ namespace mtape
     public class TapeWinAPI
     {
         private String m_tapeDrive = string.Empty;
+        private Boolean m_TapeOpen = false;
+
 
         #region Private variables
 
@@ -139,8 +141,15 @@ namespace mtape
         public const int FALSE = 0;
         public const int TRUE = 1;
         public const int NULL = 0;
+        public const int DEVICE_TYPE_TAPE = 0;
+        public const int DEVICE_TYPE_FILE = 1;
 
         public const short INVALID_HANDLE_VALUE = -1;
+
+        public bool IsTapeOpen()
+        {
+            return m_TapeOpen;
+        }
 
         /// <summary>
         /// file share modes
@@ -239,6 +248,7 @@ namespace mtape
         public const uint ERROR_UNABLE_TO_LOCK_MEDIA = 1108;
         public const uint ERROR_UNABLE_TO_UNLOAD_MEDIA = 1109;
         public const uint ERROR_WRITE_PROTECT = 19;
+        public const uint ERROR_DEVICE_REQUIRES_CLEANING = 1165;
 
         /// <summary>
         /// types of positioning
@@ -593,7 +603,6 @@ namespace mtape
         {
             // initialize private member with passed string 
             m_tapeDriveName = strTapeDriveName;
-
             if (m_handleDeviceValue == null || m_handleDeviceValue.IsClosed)
             {
                 // try to open device
@@ -611,16 +620,19 @@ namespace mtape
                 {
                     // could not open
                     m_tapeDriveName = null;
-
                     return false;
                 }
 
                 // initialize private member
                 m_tapeDriveNumber = int.Parse(strTapeDriveName.Remove(0, 8));
-
                 this.GetTapeStatus();// this is to reset ERROR_MEDIA_CHANGED status
-
+                m_TapeOpen = true;
+                m_tapeDrive = strTapeDriveName.Substring(strTapeDriveName.Length - 5);
                 Thread.Sleep(500);
+            }
+            else
+            {
+                m_TapeOpen = true;
             }
             return true;
         }
@@ -811,14 +823,12 @@ namespace mtape
         {// consider using try-catch if this method introduces exceptions...
 
             returnCode = NO_ERROR;
-
             //write
             if (!WriteFile(m_handleDeviceValue, buffer, bytesToWrite, ref bytesWritten, IntPtr.Zero))
             {
                 returnCode = GetLastError();
                 return false;
             }
-
             return true;
         }
 
@@ -834,6 +844,7 @@ namespace mtape
                 m_handleDeviceValue.Close();
                 m_tapeDriveName = null;
                 m_tapeDriveNumber = 0;
+                m_TapeOpen = false;
             }
         }
 
@@ -848,7 +859,6 @@ namespace mtape
             returnCode = EraseTape(m_handleDeviceValue, eraseType, FALSE);
 
             if (returnCode == NO_ERROR) return true;
-
             return false;
         }
 
@@ -913,6 +923,11 @@ namespace mtape
             return false;
         }
 
+        public Boolean GetHandleValid()
+        {
+            return !m_handleDeviceValue.IsInvalid;
+        }
+
         /// <summary>
         /// Returns current tape's logical position
         /// </summary>
@@ -934,7 +949,15 @@ namespace mtape
 
             Position = (long)(offsetHigh * Math.Pow(2, 32) + offsetLow);
 
-            if (returnCode == NO_ERROR) return true;
+            if (returnCode == NO_ERROR)
+            {
+                return true;
+            }
+            else
+            {
+                Position = -1;
+                return false;
+            }
 
             return false;
         }
