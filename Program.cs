@@ -12,22 +12,28 @@ using System.Net.Mail;
 using System.Data.SQLite;
 using System.Web;
 using System.IO.Compression;
+using System.Configuration;
+
 
 namespace mtape
 {
     class Program
     {
         private static TapeWinAPI API = new TapeWinAPI();
+        private static DiskWinAPI DISKAPI = new DiskWinAPI();
         private static int m_Count = 0;
         private static String m_Filename = string.Empty;
+        private static String DiskName = string.Empty;
         private static string m_Output = string.Empty;
         private static String newTapeScript = string.Empty;
-        private static int m_VolumeNumber = 0;
+//        private static String newDiskScript = string.Empty;
+        private static int m_VolumeNumber = 1;
         private static long m_NeededPosition = 0;
         private static long m_CurrentPosition = 0;
         private static long m_OverridePosition = -1;
         private static string m_LogFile = string.Empty;
         private static string m_ErrorLog = string.Empty;
+        private static System.Collections.Specialized.NameValueCollection appSettings = System.Configuration.ConfigurationManager.AppSettings;
 
 
         private const int NewTape = 0;
@@ -36,6 +42,12 @@ namespace mtape
         private const int Alert = 3;
         private const int TapeNeeded = 4;
         private const int Clean = 5;
+        private const int NewDisk = 6;
+        private const int StartDiskBackup = 7;
+        private const int EndDiskBackup = 8;
+        private const int DiskNeeded = 9;
+        private const int NewVolumeStarted = 10;
+
         private static string m_Message = string.Empty;
         private static string m_tapeDrive = string.Empty;
 
@@ -51,7 +63,10 @@ namespace mtape
         /// <param name="string[] args"></param>
         static void Main(string[] args)
         {
+            readConfig();
+
             SetTape("tape0");
+            
 
             int argMax = args.Length;
             for (int argCnt = 0; argCnt < argMax; argCnt++)
@@ -67,13 +82,20 @@ namespace mtape
                     case "-f":
                         if (API.TapeDrive != args[argCnt + 1])
                         {
-                            System.Console.WriteLine("Changing tape device " + args[argCnt + 1]);
+                            System.Console.WriteLine("Changing device " + args[argCnt + 1]);
                         }
                         else
                         {
-                            System.Console.WriteLine("Specified tape device is the same as the default.  Not changed.");
+                            System.Console.WriteLine("Specified device is the same as the default.  Not changed.");
                         }
-                        SetTape(args[argCnt + 1]); // next value must be the drive name
+                        if (args[argCnt + 1].ToLower().StartsWith("tape"))
+                        {
+                            SetTape(args[argCnt + 1]); // next value must be the drive name
+                        }
+                        else
+                        {
+                            SetDisk(args[argCnt + 1]);
+                        }
                         argCnt++; // increment counter to skip next value.
                         break;
                     case "-L":
@@ -105,6 +127,11 @@ namespace mtape
                         System.Console.WriteLine("New tape script:" + newTapeScript);
                         argCnt++;
                         break;
+                    //case "--newdisk":
+                    //    newDiskScript = args[argCnt + 1];
+                    //    System.Console.WriteLine("New disk script:" + newDiskScript);
+                    //    argCnt++;
+                    //    break;
                     default:
                         int tmpInt = 0;
                         if (int.TryParse(args[argCnt], out tmpInt)) // Is this value a number?  If so, then it is the count
@@ -346,7 +373,11 @@ namespace mtape
                         STSETCLN();
                         break;
                     case "test":
-                        NextTape();
+                        Dictionary<String,String> tmpDict = DISKAPI.getDriveInfo("d");
+                        foreach (String tmpKey in tmpDict.Keys)
+                        {
+                            System.Console.WriteLine(tmpKey + ": " + tmpDict[tmpKey]);
+                        }
                         Environment.Exit(1);
                         break;
                     case "locate":
@@ -357,6 +388,9 @@ namespace mtape
                         break;
                     case "read":
                         ReadTape();
+                        break;
+                    case "readdisk":
+                        ReadDisk();
                         break;
                     case "append":
                         AppendtoLibrary();
@@ -370,6 +404,9 @@ namespace mtape
                     case "writelist":
                         WriteTapeFromList();
                         break;
+                    case "writedisklist":
+                        WriteDiskFromList();
+                        break;
                 }
             }
             if (API.IsTapeOpen())
@@ -378,7 +415,28 @@ namespace mtape
             }
         }
 
+        private static void readConfig()
+        {
+            try
+            {
 
+                if (appSettings.Count == 0)
+                {
+                    LogError("readConfig", "AppSettings is empty.");
+                }
+                else
+                {
+                    foreach (var key in appSettings.AllKeys)
+                    {
+                        LogMessage("readConfig",String.Format("Key: {0} Value: {1}", key, appSettings[key]));
+                    }
+                }
+            }
+            catch (ConfigurationErrorsException)
+            {
+                LogError("readConfig", "Error reading app settings");
+            }
+        }
 
         /// <summary>
         /// Locates a file in the tape library and requests the volume that that file is located on, then positions the tape at that file.
@@ -428,6 +486,107 @@ namespace mtape
             conn.Close();
         }
 
+
+        private static void WriteDiskFile(String fileName, Boolean SupressMessages = false, Boolean AddToDatabase = true)
+        {
+            const int HR_ERROR_HANDLE_DISK_FULL = unchecked((int)0x80070027);
+            const int HR_ERROR_DISK_FULL = unchecked((int)0x80070070);
+
+            String targetName = string.Empty;
+            
+            FileInfo FI = new FileInfo(fileName);
+            String tmpDir = FI.DirectoryName;
+            tmpDir = tmpDir.Substring(tmpDir.IndexOf(":")+2);
+            if(!DISKAPI.DiskDrive.EndsWith("\\"))
+            {
+                DISKAPI.DiskDrive += "\\";
+            }
+            tmpDir = DISKAPI.DiskDrive + tmpDir;
+            targetName = Path.Combine(tmpDir, FI.Name);
+            int bytesRead = 0;
+            int MAX_BUFFER = 32485;
+            byte[] buffer = new byte[MAX_BUFFER];
+
+            using (FileStream fs = File.Open(fileName, FileMode.Open, FileAccess.Read))
+            using (BufferedStream bs = new BufferedStream(fs))
+            {
+                if(!System.IO.Directory.Exists(tmpDir))
+                {
+                    System.IO.Directory.CreateDirectory(tmpDir);
+                }
+                FileStream ts = File.Create(targetName, MAX_BUFFER);
+                while ((bytesRead = bs.Read(buffer, 0, MAX_BUFFER)) != 0) //reading 1mb chunks at a time
+                {
+                    try
+                    {
+                        ts.Write(buffer, 0, bytesRead);
+                    }
+                    catch (System.IO.IOException IO)
+                    {
+                        if (IO.HResult == HR_ERROR_HANDLE_DISK_FULL || IO.HResult == HR_ERROR_DISK_FULL)
+                        {
+                            if (newTapeScript != string.Empty)
+                            {
+                                // Flush and close the file
+                                ts.Flush();
+                                ts.Close();
+                                int retCode = 0;
+                                runMTapeScript(NewDisk, newTapeScript, out retCode, "New Disk Required.");
+                                m_VolumeNumber++;
+                                addVolumeToDatabase();
+                                runMTapeScript(NewVolumeStarted, newTapeScript, out retCode, "New Volume Started.");
+                                // Create new file handle on new disk for remainder.
+                                ts = File.Create(targetName, MAX_BUFFER);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                ts.Flush();
+                ts.Close();
+            }
+        }
+
+
+        private static void WriteDiskFromList()
+        {
+            if (newTapeScript != string.Empty)
+            {
+                int retCode = 0;
+                //  Will need to return 0 (true) or -1 (false) to continue or not.
+                runMTapeScript(StartDiskBackup, newTapeScript, out retCode, "");
+                addVolumeToDatabase();
+            }
+
+            StreamReader sr = new StreamReader(m_Filename);
+            using (StreamWriter transWrite = new StreamWriter("transWrite.trn", true))
+            {
+                while (!sr.EndOfStream)
+                {
+                    // Read from transaction file
+                    String tmpFile = sr.ReadLine();
+                    LogMessage("WriteDiskFromList", "Writing file (" + tmpFile + ")");
+                    // Write the file to tape at current location
+                    if (System.IO.File.Exists(tmpFile))
+                    {
+                        WriteDiskFile(tmpFile, false, true);
+                        
+                    }
+                    // Record that it was written (last file might be duplicated...but, shouldn't be an issue)
+                    transWrite.WriteLine(tmpFile);
+                }
+            }
+            if (newTapeScript != string.Empty)
+            {
+                int retCode = 0;
+                //  Will need to return 0 (true) or -1 (false) to continue or not.
+                runMTapeScript(EndDiskBackup, newTapeScript, out retCode, "");
+            }
+
+            LogMessage("WriteList", "Done");
+        }
+
+
         /// <summary>
         /// Virtually identical to ContinueWrite....however uses a user supplied list of files to write to tape.
         /// </summary>
@@ -453,7 +612,7 @@ namespace mtape
                     if (System.IO.File.Exists(tmpFile))
                     {
                         WriteFileHeader(tmpFile);
-                        WriteFile(tmpFile);
+                        WriteFile(tmpFile,false,true);
                     }
                     // Record that it was written (last file might be duplicated...but, shouldn't be an issue)
                     transWrite.WriteLine(tmpFile);
@@ -469,23 +628,88 @@ namespace mtape
             LogMessage("WriteList", "Done");
         }
 
+        private static Dictionary<String,String> parseJSON(String JSONString)
+        {
+            Dictionary<String, String> retValue = new Dictionary<string, string>();
+            String tmpLine = JSONString;
+            tmpLine = tmpLine.Replace("{", "").Replace("}", "").Replace("\"", "");
+            string[] tmpLines = tmpLine.Split(',');
+            string[] settings;
 
-        private static void WriteFileHeader(String FileName)
+            foreach (String workLine in tmpLines)
+            {
+                settings = workLine.Split(':');
+                retValue.Add(settings[0], settings[1]);
+            }
+
+            return retValue;
+        }
+
+        private static void testCode()
+        {
+            String tmpLine = "";
+            tmpLine = "{\"Name\":\"02x01.Episode IV - A New Hope (2009-03-03).mkv\",\"CreationTime\":\"2/8/2021 12:42:45 PM\",\"ModifyTime\":\"2/8/2021 12:44:54 PM\",\"FileSize\":4439848929}";
+
+        }
+
+        private static Boolean ReadHeader(String FileName)
+        {
+            Boolean retValue = false;
+            // Read temporary JSON file from tape
+            ReadFile("Header File", "ReadFileHeader.json",true);
+            Dictionary<String, String> JSONValues = new Dictionary<string, string>();
+
+            try
+            {
+                if(!System.IO.File.Exists("ReadFileHeader.json"))
+                {
+                    LogError("ReadHeader", "JSON file does not exist.");
+                    return false;
+                }
+                using (System.IO.StreamReader SR = System.IO.File.OpenText("ReadFileHeader.json"))
+                {
+                    String tmpLine = SR.ReadToEnd();
+                    JSONValues = parseJSON(tmpLine.Trim());
+                    if(JSONValues["Name"].Trim() == FileName.Trim())
+                    {
+                        LogMessage("ReadHeader", "Header is correct");
+                        retValue = true;
+                    }
+                    else
+                    {
+                        LogMessage("ReadHeader", "Incorrect header.  Read:" + JSONValues["Name"]); 
+                    }
+                }
+            }
+            catch(Exception ex)
+            {
+                LogError("ReadHeader", "Error reading header :" + ex.Message);
+            }
+            return retValue;
+        }
+
+        private static void WriteFileHeader(String FileName, long CompressedSize = 0)
         {
             System.IO.FileInfo FI = new FileInfo(FileName);
             String JSONString = string.Empty;
-
-            if (System.IO.File.Exists("FileInfo.JSON"))
+            string tempFile = Path.GetTempFileName();
+            tempFile += ".JSON";
+            if (CompressedSize == 0)
             {
-                System.IO.File.Delete("FileInfo.JSON");
+                JSONString += "{\"Name\":\"" + HttpUtility.HtmlEncode(FI.Name) + "\",\"Directory\":\"" + HttpUtility.HtmlEncode(FI.DirectoryName) + "\",\"CreationTime\":\"" + HttpUtility.HtmlEncode(FI.CreationTime) + "\",\"ModifyTime\":\"" + HttpUtility.HtmlEncode(FI.LastWriteTime) + "\",\"FileSize\":" + HttpUtility.HtmlEncode(FI.Length.ToString()) + "}";
             }
-            JSONString += "{\"Name\":\"" + HttpUtility.HtmlEncode(FI.Name) + "\",\"CreationTime\":\"" + HttpUtility.HtmlEncode(FI.CreationTime) + "\",\"ModifyTime\":\"" + HttpUtility.HtmlEncode(FI.LastWriteTime) + "\",\"FileSize\":" + HttpUtility.HtmlEncode(FI.Length.ToString()) + "}";
-            using (System.IO.StreamWriter SW = System.IO.File.CreateText("FileInfo.JSON"))
+            else
+            {
+                JSONString += "{\"Name\":\"" + HttpUtility.HtmlEncode(FI.Name) + "\",\"Directory\":\"" + HttpUtility.HtmlEncode(FI.DirectoryName) + "\",\"CreationTime\":\"" + HttpUtility.HtmlEncode(FI.CreationTime) + "\",\"ModifyTime\":\"" + HttpUtility.HtmlEncode(FI.LastWriteTime) + "\",\"FileSize\":" + HttpUtility.HtmlEncode(FI.Length.ToString()) + ",\"CompressedFileSize\":" + HttpUtility.HtmlEncode(CompressedSize.ToString()) + "}";
+            }
+
+            using (System.IO.StreamWriter SW = System.IO.File.CreateText(tempFile))
             {
                 SW.WriteLine(JSONString);
             }
+            // Supress messages, do not add to database
             WriteFile("FileInfo.JSON", true,false);
-            System.IO.File.Delete("FileInfo.JSON");
+            System.IO.File.Delete(tempFile);
         }
 
         /// <summary>
@@ -502,7 +726,7 @@ namespace mtape
                     String tmpFile = sr.ReadLine();
                     LogMessage("ContinueTape", "Writing file (" + tmpFile + ")");
                     // Write the file to tape at current location
-                    WriteFile(tmpFile);
+                    WriteFile(tmpFile,false,true);
                     // Record that it was written (last file might be duplicated...but, shouldn't be an issue)
                     transWrite.WriteLine(tmpFile);
                 }
@@ -595,6 +819,7 @@ namespace mtape
                 case "fsfm":
                 case "bsf":
                 case "bsfm":
+                case "test":
                 case "fsr":
                 case "bsr":
                 case "fss":
@@ -644,6 +869,7 @@ namespace mtape
                 case "resume":
                 case "append":
                 case "writelist":
+                case "writedisklist":
                     return true;
                     break;
             }
@@ -692,12 +918,90 @@ namespace mtape
             LogMessage("InitializeLibrary", "Library has been initialized.");
         }
 
+
+        /// <summary>
+        /// Read a file from disk
+        /// </summary>
+        /// <param name="string Filename to write to"></param>
+        /// <returns>bool success</returns>
+        private static bool ReadDiskFile(String Filename, String Target, Boolean SuppressMessages = false)
+        {
+            bool retValue = true;
+            bool tapeOpen = false;
+            bool Continue = true;
+            uint bytesRead = 0;
+            int MAX_BUFFER = 32485;
+            byte[] buffer = new byte[MAX_BUFFER];
+            uint retCode = 0;
+
+            if (API.IsTapeOpen())
+            {
+
+                if (!SuppressMessages)
+                {
+                    LogMessage("ReadDiskFile", "Reading from disk to file " + Filename);
+                    System.Console.WriteLine("Restoring to " + Target + " if this is not correct, abort now!!!");
+                    System.Console.WriteLine("Press any key to continue.");
+                    System.Console.ReadLine();
+                }
+                using (FileStream fs = File.Open(Target, FileMode.Create, FileAccess.Write))
+                using (BufferedStream bs = new BufferedStream(fs))
+                {
+                    while (Continue)
+                    {
+
+                        while (API.Read(ref buffer, (uint)MAX_BUFFER, ref bytesRead, ref retCode))
+                        {
+                            bs.Write(buffer, 0, (int)bytesRead);
+                        }
+                        bs.Flush();
+                        fs.Flush();
+                        Continue = false;
+                        if (retCode != 0)
+                        {
+                            switch (retCode)
+                            {
+                                case 0234:  //more data is available
+                                            //update error log and status
+                                    LogError("ReadFile", "aborted due to SCSI Controller problem");
+                                    break;
+                                case 1106:  //incorrect block size
+                                            //update error log and status
+                                    LogError("ReadFile", "aborted due to invalid block size");
+                                    break;
+                                case 1101:  //reached file mark
+                                    LogError("ReadFile", "File mark detected.");
+                                    break;
+                                case 1104:  //EOD reached
+                                    LogError("ReadFile", "EOD detected");
+                                    break;
+                                case 1129:  // Physical EOT
+                                case 1100:  // EOT marker reached
+                                    LogError("ReadFile", "EOT detected.");
+                                    Continue = NextTape();
+                                    break;
+                                default:    //any other errors
+                                    LogError("ReadFile", "aborted with error code: " + retCode.ToString());
+                                    break;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                LogError("ReadFile", "Unable to open tape drive");
+            }
+            return retValue;
+        }
+
+
         /// <summary>
         /// Read a file from tape
         /// </summary>
         /// <param name="string Filename to write to"></param>
         /// <returns>bool success</returns>
-        private static bool ReadFile(String Filename)
+        private static bool ReadFile(String Filename, String Target,Boolean SuppressMessages = false)
         {
             bool retValue = true;
             bool tapeOpen = false;
@@ -719,11 +1023,14 @@ namespace mtape
                 int noOfFiles = 0;
                 uint retCode = 0;
                 bool Continue = true;
-                LogMessage("ReadFile", "Reading from tape to file " + Filename);
-                System.Console.WriteLine("Restoring to " + Filename + " if this is not correct, abort now!!!");
-                System.Console.ReadLine();
-
-                using (FileStream fs = File.Open(Filename, FileMode.Create, FileAccess.Write))
+                if (!SuppressMessages)
+                {
+                    LogMessage("ReadFile", "Reading from tape to file " + Filename);
+                    System.Console.WriteLine("Restoring to " + Target + " if this is not correct, abort now!!!");
+                    System.Console.WriteLine("Press any key to continue.");
+                    System.Console.ReadLine();
+                }
+                using (FileStream fs = File.Open(Target, FileMode.Create, FileAccess.Write))
                 using (BufferedStream bs = new BufferedStream(fs))
                 {
                     while (Continue)
@@ -763,14 +1070,8 @@ namespace mtape
                                     break;
                             }
                         }
-                        else
-                        {
-                            Continue = false;
-                        }
-                        LogMessage("ReadFile", "End of read");
                     }
                 }
-                LogMessage("ReadFile", "File was read from tape");
             }
             else
             {
@@ -780,13 +1081,22 @@ namespace mtape
         }
 
         /// <summary>
+        /// Command to read a single file from disk drive
+        /// </summary>
+        private static void ReadDisk()
+        {
+            ReadDiskFile(m_Filename, m_Output);
+        }
+
+        /// <summary>
         /// Command to read a single file from tape drive
         /// </summary>
         private static void ReadTape()
         {
-            Dummy("Read");
-            LogMessage("Read", "Will eventually read a file from the mounted volume from the current location.");
-            ReadFile(m_Filename);
+            if (ReadHeader(m_Filename))
+            {
+                ReadFile(m_Filename, m_Output);
+            }
         }
 
         /// <summary>
@@ -878,6 +1188,36 @@ namespace mtape
             return retValue;
         }
 
+        private static bool EJECTDISK()
+        {
+            // Ensure that the path includes the drive letter and colon
+            FileInfo FI = new FileInfo(DISKAPI.DiskDrive);
+            String driveLetter = FI.DirectoryName.Substring(0,2);
+            // In theory, this should work for either USB or physically attached drive (i.e. hot swappable drive bay)....still needs testing.
+            return DISKAPI.EjectDisk(driveLetter);
+        }
+
+        private static bool DetectNewDisk()
+        {
+            // Ensure that the path includes the drive letter and colon
+            FileInfo FI = new FileInfo(DISKAPI.DiskDrive);
+            String driveLetter = FI.DirectoryName.Substring(0, 2);
+            Boolean foundRoot = false;
+            do
+            {
+                try
+                {
+                    DirectoryInfo DI = new DirectoryInfo(Path.Combine(driveLetter, "\\"));
+                    foundRoot = true;
+                }
+                catch(Exception ex)
+                {
+
+                }
+            } while (!foundRoot);
+            return false;
+        }
+
 
         /// <summary>
         /// Keeps checking to see if the tape drive is read (i.e. tape loaded and ready to write)
@@ -955,17 +1295,65 @@ namespace mtape
             try
             {
                 cleanVariables(ref mVariables);
-
-                var smtpClient = new SmtpClient(mVariables["MailHost"])
+                if (mVariables.ContainsKey("MailHost") && mVariables.ContainsKey("MailPort") && mVariables.ContainsKey("MailUser") && mVariables.ContainsKey("MailPassword") && mVariables.ContainsKey("MailSender") && mVariables.ContainsKey("MailRecipient") && mVariables.ContainsKey("MailSubject") && mVariables.ContainsKey("MailMessage"))
                 {
-                    Port = int.Parse(mVariables["MailPort"]),
-                    Credentials = new System.Net.NetworkCredential(mVariables["MailUser"], mVariables["MailPassword"]),
-                    EnableSsl = true,
-                };
-                String tmpMessage = mVariables["MailMessage"];
-                tmpMessage = tmpMessage.Replace("$Volume", "VOL_" + zeroFill(m_VolumeNumber,4)).Replace("$VOLUME", zeroFill(m_VolumeNumber,4)).Replace("$REASON", mVariables["$REASON"]);
-                smtpClient.Send(mVariables["MailSender"], mVariables["MailRecipient"], mVariables["MailSubject"], tmpMessage);
-                RetValue = true;
+                    var smtpClient = new SmtpClient(mVariables["MailHost"])
+                    {
+                        Port = int.Parse(mVariables["MailPort"]),
+                        Credentials = new System.Net.NetworkCredential(mVariables["MailUser"], mVariables["MailPassword"]),
+                        EnableSsl = true,
+                    };
+                    String tmpMessage = mVariables["MailMessage"];
+                    if(!mVariables.ContainsKey("$REASON"))
+                    {
+                        mVariables.Add("$REASON", "");
+                    }
+                    tmpMessage = tmpMessage.Replace("$Volume", "VOL_" + zeroFill(m_VolumeNumber, 4)).Replace("$VOLUME", "VOL_" + zeroFill(m_VolumeNumber, 4));
+                    foreach (String tmpVar in mVariables.Keys)
+                    {
+                        tmpMessage = tmpMessage.Replace(tmpVar, mVariables[tmpVar]);
+                    }
+//                    tmpMessage = tmpMessage.Replace("$Volume", "VOL_" + zeroFill(m_VolumeNumber, 4)).Replace("$VOLUME", zeroFill(m_VolumeNumber, 4)).Replace("$REASON", mVariables["$REASON"]);
+                    smtpClient.Send(mVariables["MailSender"], mVariables["MailRecipient"], mVariables["MailSubject"], tmpMessage);
+                    RetValue = true;
+                }
+                else
+                {
+                    if(!mVariables.ContainsKey("MailSender"))
+                    {
+                        LogError("SendMail", "MailSender is not specified.");
+                    }
+                    if (!mVariables.ContainsKey("MailRecipient"))
+                    {
+                        LogError("SendMail", "MailRecipient is not specified.");
+                    }
+                    if (!mVariables.ContainsKey("MailUser"))
+                    {
+                        LogError("SendMail", "MailUser is not specified.");
+                    }
+                    if (!mVariables.ContainsKey("MailPassword"))
+                    {
+                        LogError("SendMail", "MailPassword is not specified.");
+                    }
+                    if (!mVariables.ContainsKey("MailHost"))
+                    {
+                        LogError("SendMail", "MailHost is not specified.");
+                    }
+                    if (!mVariables.ContainsKey("MailPort"))
+                    {
+                        LogError("SendMail", "MailPort is not specified.");
+                    }
+                    if (!mVariables.ContainsKey("MailSubject"))
+                    {
+                        LogError("SendMail", "MailSubject is not specified.");
+                    }
+                    if (!mVariables.ContainsKey("MailMessage"))
+                    {
+                        LogError("SendMail", "MailMessage is not specified.");
+                    }
+                    RetValue = false;
+                }
+                
             }
             catch (Exception ex)
             {
@@ -998,11 +1386,20 @@ namespace mtape
                         switch (matches[0].Value.ToLower())
                         {
                             case "eject()":
-                                // Commented out for testing purposes
-                                //                                EJECT();
+                                EJECT();
+                                break;
+                            case "ejectdisk()":
+                                EJECTDISK();
                                 break;
                             case "keypress()":
                                 System.Console.ReadKey();
+                                break;
+                            case "detectnewdisk()":
+                                LogMessage("runMTapeScript", "Detecting new disk in drive.");
+                                if (!DetectNewDisk())
+                                {
+                                    return false;
+                                }
                                 break;
                             case "detectnewtape()":
                                 LogMessage("runMTapeScript", "Detecting new tape in drive.");
@@ -1238,6 +1635,10 @@ namespace mtape
                 if (!CallScript(out retCode, newTape))
                 {
                     LogError("NextTape", "Error calling script " + retCode);
+                }
+                else
+                {
+                    retValue = true;
                 }
             }
             else
@@ -1560,6 +1961,7 @@ namespace mtape
                 EOF();
                 if (AddToDatabase)
                 {
+
                     AddFileToDatabase(Filename);
                 }
             }
@@ -1578,129 +1980,26 @@ namespace mtape
         private static bool WriteFileWithCompression(String Filename, Boolean SupressMessages = false, Boolean AddToDatabase = true)
         {
             bool retValue = true;
-            bool tapeOpen = false;
-            
-
-            m_CurrentPosition = getCurrentPosition();
-
-            // If the override psoition != -1 then use it.
-            if (m_OverridePosition != -1)
+            // Create a compressed version of the file.
+            LogMessage("WriteFileWithCompression", "Compressing file.");
+            FileInfo FI = new FileInfo(Filename);
+            string tempFilename = Path.GetTempFileName();
+            tempFilename += ".gz";
+            String CompressedFilename = tempFilename;
+            using (FileStream oFileStream = File.Open(Filename, FileMode.Open))
+            using (FileStream cFileStream = File.Create(CompressedFilename))
+            using (var compressor = new GZipStream(cFileStream, CompressionMode.Compress))
             {
-                m_CurrentPosition = m_OverridePosition;
+                oFileStream.CopyTo(compressor);
             }
-
-            // If not adding to the database (i.e. JSO file header) capture the override position.
-            // The intent is that the database record points to the header and not the physical file.
-            if (!AddToDatabase)
-            {
-                m_OverridePosition = m_CurrentPosition;
-            }
-            else
-            {
-                m_OverridePosition = -1;
-            }
-            if (m_Count != 0)
-            {
-                if (!SupressMessages)
-                {
-                    LogMessage("WriteFile", "Seeking to the specified location before writing.");
-                }
-                SEEKL((long)m_Count);
-            }
-            if (!API.IsTapeOpen())
-            {
-                if (!API.Open(@"\\.\" + API.TapeDrive))
-                {
-                    if (!SupressMessages)
-                    {
-                        LogMessage("WriteFile", "Tape drive:" + @"\\.\" + API.TapeDrive);
-                        LogError("Open", new Win32Exception((int)(uint)Marshal.GetLastWin32Error()).Message);
-                    }
-                }
-            }
-            if (API.IsTapeOpen())
-            {
-                int MAX_BUFFER = API.MaximumBlockSizeDrive; //1MB
-                int MIN_BUFFER = API.MinimumBlockSizeDrive;
-                int tmpOut = 0;
-                byte[] buffer = new byte[MAX_BUFFER];
-                int bytesRead;
-                int noOfFiles = 0;
-
-                int chunksRequired = FileChunkCount(Filename);
-
-
-                using (FileStream fs = File.Open(Filename, FileMode.Open, FileAccess.Read))
-                using (MemoryStream CompressedFileStream = new MemoryStream())
-                using (var Compressor = new GZipStream(CompressedFileStream,CompressionMode.Compress, true))
-                using (BufferedStream bs = new BufferedStream(fs))
-                {
-                    fs.CopyTo(Compressor);
-                    while ((bytesRead = Compressor.Read(buffer, 0, MAX_BUFFER)) != 0) //reading 1mb chunks at a time
-
-//                        while ((bytesRead = bs.Read(buffer, 0, MAX_BUFFER)) != 0) //reading 1mb chunks at a time
-                    {
-                        noOfFiles++;
-                        uint bytesWritten = 0;
-                        uint retCode = 0;
-                        if (!API.Write(ref buffer, (uint)bytesRead, ref bytesWritten, ref retCode))
-                        {
-                            switch (retCode)
-                            {
-                                case 1112:  // Not media in drive
-                                    LogError("WriteFile", "There is no tape in the drive.");
-                                    Environment.Exit(1);
-                                    break;
-                                case 0234:  //more data is available
-                                            //update error log and status
-                                    LogError("WriteFile", "aborted due to SCSI Controller problem");
-                                    runMTapeScript(Alert, newTapeScript, out tmpOut, "Aborted due to SCSI Controller problem.");
-
-                                    break;
-                                case 1106:  //incorrect block size
-                                            //update error log and status
-                                    LogError("WriteFile", "aborted due to invalid block size");
-                                    runMTapeScript(Alert, newTapeScript, out tmpOut, "Aborted due to invalid block size.");
-                                    break;
-                                case 1129:  // Physical end of tape
-                                case 1100:  // EOT Marker reached
-                                    LogError("WriteFile", "EOT detected.");
-                                    if (NextTape())
-                                    {
-                                        m_VolumeNumber++;
-                                        addVolumeToDatabase();
-                                        continue;
-                                    }
-                                    break;
-                                case 1156:  // Device Requires Cleaning
-                                    LogMessage("WriteFile", "Tape Drive Requires Cleaning.");
-                                    runMTapeScript(Clean, newTapeScript, out tmpOut, "Tape drive requires cleaning.");
-                                    break;
-
-                                case 1110:  // Media Changed (normal if new tape was inserted.
-                                    continue;
-                                case 0:
-                                    break;
-                                default:    //any other errors
-                                    LogError("WriteFile", "aborted with error code: " + retCode.ToString());
-                                    runMTapeScript(Alert, newTapeScript, out tmpOut, "Aborted Error Code:" + retCode.ToString());
-                                    break;
-                            }
-                        }
-
-                    }
-                }
-                // Write End of File marker
-                EOF();
-                if (AddToDatabase)
-                {
-                    AddFileToDatabase(Filename);
-                }
-            }
-            else
-            {
-                LogError("WriteFile", "Unable to open tape drive");
-            }
+            FileInfo cFI = new FileInfo(CompressedFilename);
+            LogMessage("WriteFileWithCompression", "Original file size: " + FI.Length + " Compressed size:" + cFI.Length);
+            // Create the file header of the original file name, size, etc...
+            LogMessage("WriteFileWithCompression", "Writing header to tape.");
+            WriteFileHeader(Filename,cFI.Length);
+            LogMessage("WriteFileWithCompression", "Writing file to tape.");
+            WriteFile(tempFilename);
+            File.Delete(tempFilename);
             return retValue;
         }
 
@@ -1854,7 +2153,7 @@ namespace mtape
                     {
                         LogMessage("WriteTape", "Writing file (" + tmpFile + ")");
                         WriteFileHeader(tmpFile);
-                        WriteFile(tmpFile);
+                        WriteFile(tmpFile, false, true);
                         transWrite.WriteLine(tmpFile);
                     }
                 }
@@ -1862,7 +2161,7 @@ namespace mtape
             else
             {
                 WriteFileHeader(FI.FullName);
-                WriteFile(FI.FullName);
+                WriteFile(FI.FullName,false,true);
             }
             if (newTapeScript != string.Empty)
             {
@@ -1907,7 +2206,10 @@ namespace mtape
                         if (SEEKL(newLocation))
                         {
                             LogMessage("Locate", "Reading...");
-                            ReadFile(m_Output);
+                            if (ReadHeader(m_Filename))
+                            {
+                                ReadFile(m_Filename, m_Output);
+                            }
                         }
                     }
                     else
@@ -2981,6 +3283,16 @@ namespace mtape
                                                 {
                                                     switch (matches[0].Value.ToLower())
                                                     {
+                                                        case "ejectdisk()":
+                                                            try
+                                                            {
+                                                                EJECTDISK();
+                                                            }
+                                                            catch(Exception ex)
+                                                            {
+                                                                LogError("ScriptProcessor:EjectDisk:", ex.Message);
+                                                            }
+                                                            break;
                                                         case "eject()":
                                                             try
                                                             {
@@ -2989,16 +3301,32 @@ namespace mtape
                                                             }
                                                             catch(Exception ex)
                                                             {
-                                                                LogError("ScriptProcessor:Eject:",ex.Message);
+                                                                LogError("ScriptProcessor:" + funcName, ex.Message);
                                                             }
                                                             break;
                                                         case "keypress()":
                                                             System.Console.ReadKey();
                                                             break;
+                                                        case "detectnewdisk()":
+                                                            try
+                                                            {
+                                                                LogMessage("ScriptProcessor:" + funcName,"Detecting new disk in drive.");
+                                                                if (!DetectNewDisk())
+                                                                {
+                                                                    return 1;
+                                                                }
+                                                            }
+                                                            catch (Exception ex)
+                                                            {
+                                                                LogError("ScriptProcessor:Eject:", ex.Message);
+                                                            }
+
+                                                            // tape detection 
+                                                            break;
                                                         case "detectnewtape()":
                                                             try
                                                             {
-                                                                System.Console.WriteLine("[" + funcName + "] Detecting new tape in drive.");
+                                                                LogMessage("ScriptProcessor:" + funcName, "Detecting new tape in drive.");
                                                                 if (!DetectNewTape())
                                                                 {
                                                                     return 1;
@@ -3014,7 +3342,7 @@ namespace mtape
                                                         case "sendmail()":
                                                             try
                                                             {
-                                                                System.Console.WriteLine("[" + funcName + "] Sending email");
+                                                                LogMessage("ScriptProcessor:" + funcName,"Sending email");
                                                                 if (!mVariables.ContainsKey("Reason"))
                                                                 {
                                                                     mVariables.Add("Reason", m_GlobalVariables["$REASON"]);
@@ -3040,11 +3368,11 @@ namespace mtape
                                                             {
                                                                 if (m_GlobalVariables["$REASON"] == "New Tape")
                                                                 {
-                                                                    System.Console.WriteLine("[" + funcName + "] " + matches[1].Value);
+                                                                    LogMessage("ScriptProcessor:" + funcName, matches[1].Value);
                                                                 }
                                                                 else
                                                                 {
-                                                                    System.Console.WriteLine("[" + funcName + "] " + matches[1].Value);
+                                                                    LogMessage("ScriptProcessor:" + funcName, matches[1].Value);
                                                                 }
                                                             }
                                                             catch (Exception ex)
@@ -3059,7 +3387,7 @@ namespace mtape
                                                             {
                                                                 if (!RunExternal(out retCode, " + funcName + "))
                                                                 {
-                                                                    System.Console.WriteLine("[" + funcName + "] External command reported an error :" + retCode);
+                                                                    LogError("ScriptProcessor:" + funcName, "External command reported an error :" + retCode);
                                                                     return 1;
                                                                 }
                                                             }
@@ -3100,7 +3428,7 @@ namespace mtape
                                                                 }
                                                                 else
                                                                 {
-                                                                    System.Console.WriteLine("[" + funcName + "] Unrecognized command line " + tmpText);
+                                                                    LogError("ScriptProcessor:" + funcName,"Unrecognized command line " + tmpText);
                                                                 }
                                                             }
                                                             catch (Exception ex)
@@ -3253,6 +3581,21 @@ namespace mtape
                         break;
                     case Clean:
                         Reason = "Clean";
+                        break;
+                    case NewDisk:
+                        Reason = "New Disk";
+                        break;
+                    case StartDiskBackup:
+                        Reason = "Disk Archive Started";
+                        break;
+                    case EndDiskBackup:
+                        Reason = "Disk Archive Ended";
+                        break;
+                    case DiskNeeded:
+                        Reason = "Disk Needed";
+                        break;
+                    case NewVolumeStarted:
+                        Reason = "New Volume Started";
                         break;
                 }
 
@@ -3728,6 +4071,12 @@ namespace mtape
         private static void SetTape(String tapeDrive)
         {
             API.TapeDrive = tapeDrive;
+            
+        }
+
+        private static void SetDisk(String diskDrive)
+        {
+            DISKAPI.DiskDrive = diskDrive;
         }
 
         /// <summary>
@@ -3922,7 +4271,7 @@ namespace mtape
             ScreenWriter("", "defblksize, defdensity, defdrvbuffer, defcompression, stsetcln,");
             ScreenWriter("", "sttimeout, stlongtimeout, densities, setpartition, mkpartition");
             ScreenWriter("", "partseek, asf, stshowoptions, locate, read, write, continue");
-            ScreenWriter("", "resume, writelist, info, init.");
+            ScreenWriter("", "resume, writelist, writedisklist, info, init.");
         }
 
         private static void testMessage()
@@ -4068,11 +4417,11 @@ namespace mtape
             ScreenWriter("");
             ScreenWriter("", "sttimeout", "sets the normal timeout for the device.  The value is given in seconds.  Allowed only for the superuser.");
             ScreenWriter("");
-            ScreenWriter("", "stlongtimeout", "sets the long timeout for the device.  The value is given in seconds.  Allowedo nly for the superuser.");
+            ScreenWriter("", "stlongtimeout", "sets the long timeout for the device.  The value is given in seconds.  Allowed only for the superuser.");
             ScreenWriter("");
             ScreenWriter("", "stsetcln", "set the cleaning request interpretation parameters.");
             ScreenWriter("");
-            ScreenWriter("", "read", "reads a file from tape and optionally writes to specified file.  Default writes to stdout.");
+            ScreenWriter("", "read", "reads a file (original name is required) from tape and writes to specified file.");
             ScreenWriter("");
             ScreenWriter("", "write", "writes specified file to tape.  If a location is specifed, it mtape will advance to that filemark before writing.");
             ScreenWriter("");
